@@ -1,11 +1,121 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 
-const BACKEND_HOST = window.location.hostname || 'localhost';
-const HTTP_PROTOCOL = window.location.protocol === 'https:' ? 'https:' : 'http:';
-const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-const SERVER_HTTP = `${HTTP_PROTOCOL}//${BACKEND_HOST}:8000`;
-const SERVER_WS = `${WS_PROTOCOL}//${BACKEND_HOST}:8000/ws`;
+const BACKEND_STORAGE_KEY = 'gdog.remote.backendTarget';
+const DEFAULT_BACKEND_PORT = 8000;
 const DEFAULT_JOYSTICK_GAIN = 5.0;
+
+function getDefaultBackendTarget() {
+  const host = window.location.hostname || 'localhost';
+  return `${host}:${DEFAULT_BACKEND_PORT}`;
+}
+
+function getInitialBackendTarget() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const queryTarget = (urlParams.get('backend') || '').trim();
+  if (queryTarget) {
+    return queryTarget;
+  }
+
+  try {
+    const storedTarget = (window.localStorage.getItem(BACKEND_STORAGE_KEY) || '').trim();
+    if (storedTarget) {
+      return storedTarget;
+    }
+  } catch {
+    // Ignore storage access failures.
+  }
+
+  return getDefaultBackendTarget();
+}
+
+function persistBackendTarget(target) {
+  const value = String(target || '').trim();
+
+  try {
+    if (value) {
+      window.localStorage.setItem(BACKEND_STORAGE_KEY, value);
+    } else {
+      window.localStorage.removeItem(BACKEND_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage access failures.
+  }
+
+  const url = new URL(window.location.href);
+  if (value) {
+    url.searchParams.set('backend', value);
+  } else {
+    url.searchParams.delete('backend');
+  }
+  window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+}
+
+function normalizeBackendTarget(rawValue) {
+  const fallbackHostPort = getDefaultBackendTarget();
+  const pageIsHttps = window.location.protocol === 'https:';
+  const defaultHttpProtocol = pageIsHttps ? 'https:' : 'http:';
+  const defaultWsProtocol = pageIsHttps ? 'wss:' : 'ws:';
+
+  let token = String(rawValue || '').trim();
+  let httpProtocol = defaultHttpProtocol;
+  let wsProtocol = defaultWsProtocol;
+  let hostPort = '';
+  let explicitScheme = false;
+
+  if (!token) {
+    token = fallbackHostPort;
+  }
+
+  const lowerToken = token.toLowerCase();
+  const hasExplicitScheme =
+    lowerToken.startsWith('http://')
+    || lowerToken.startsWith('https://')
+    || lowerToken.startsWith('ws://')
+    || lowerToken.startsWith('wss://');
+
+  if (hasExplicitScheme) {
+    explicitScheme = true;
+    try {
+      const parsed = new URL(token);
+      hostPort = (parsed.host || '').trim();
+      if (parsed.protocol === 'https:' || parsed.protocol === 'wss:') {
+        httpProtocol = 'https:';
+        wsProtocol = 'wss:';
+      } else {
+        httpProtocol = 'http:';
+        wsProtocol = 'ws:';
+      }
+    } catch {
+      hostPort = fallbackHostPort;
+      explicitScheme = false;
+    }
+  } else {
+    hostPort = token.replace(/^\/+|\/+$/g, '');
+  }
+
+  if (!hostPort) {
+    hostPort = fallbackHostPort;
+  }
+
+  const hasPort = hostPort.startsWith('[')
+    ? hostPort.includes(']:')
+    : hostPort.includes(':');
+  if (!hasPort) {
+    hostPort = `${hostPort}:${DEFAULT_BACKEND_PORT}`;
+  }
+
+  const normalizedInput = explicitScheme ? `${httpProtocol}//${hostPort}` : hostPort;
+  const httpBase = `${httpProtocol}//${hostPort}`;
+
+  return {
+    input: normalizedInput,
+    httpBase,
+    wsUrl: `${wsProtocol}//${hostPort}/ws`,
+    offerUrl: `${httpBase}/offer`,
+    capabilitiesUrl: `${httpBase}/capabilities`,
+    usingInsecureBackendFromHttpsPage: pageIsHttps && httpProtocol === 'http:',
+  };
+}
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -115,6 +225,9 @@ function Joystick({ label, color, onChange, size = 180 }) {
 }
 
 function App() {
+  const initialBackendInput = useMemo(() => normalizeBackendTarget(getInitialBackendTarget()).input, []);
+  const [backendInput, setBackendInput] = useState(initialBackendInput);
+  const [backendTarget, setBackendTarget] = useState(initialBackendInput);
   const [capabilities, setCapabilities] = useState({ loaded: false, webrtc: false });
   const [webrtcConnected, setWebrtcConnected] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
@@ -132,6 +245,10 @@ function App() {
 
   const vxRef = useRef(0.0);
   const omegaRef = useRef(0.0);
+  const pitchCmdRef = useRef(0.0);
+  const rollCmdRef = useRef(0.0);
+
+  const backendConfig = useMemo(() => normalizeBackendTarget(backendTarget), [backendTarget]);
 
   const disconnectWebRTC = useCallback(() => {
     if (dcRef.current) {
@@ -162,9 +279,38 @@ function App() {
     setWsConnected(false);
   }, []);
 
+  const applyBackendTarget = useCallback(() => {
+    const normalized = normalizeBackendTarget(backendInput);
+    setBackendInput(normalized.input);
+    persistBackendTarget(normalized.input);
+
+    const currentNormalized = normalizeBackendTarget(backendTarget).input;
+    const targetChanged = normalized.input !== currentNormalized;
+
+    setCapabilities({ loaded: false, webrtc: false });
+    if (targetChanged) {
+      setBackendTarget(normalized.input);
+      setStatusMessage(`Switching backend to ${normalized.httpBase} ...`);
+      return;
+    }
+
+    setStatusMessage(`Reconnecting to ${normalized.httpBase} ...`);
+    disconnectWebRTC();
+    disconnectWebSocket();
+    fetchCapabilities();
+    connectWebSocket();
+  }, [
+    backendInput,
+    backendTarget,
+    connectWebSocket,
+    disconnectWebRTC,
+    disconnectWebSocket,
+    fetchCapabilities,
+  ]);
+
   const fetchCapabilities = useCallback(async () => {
     try {
-      const res = await fetch(`${SERVER_HTTP}/capabilities`);
+      const res = await fetch(backendConfig.capabilitiesUrl);
       if (!res.ok) throw new Error(`status ${res.status}`);
       const data = await res.json();
 
@@ -172,16 +318,16 @@ function App() {
       setCapabilities({ loaded: true, webrtc: webrtcAvailable });
 
       if (webrtcAvailable) {
-        setStatusMessage('Connected to backend. WebSocket active, WebRTC available.');
+        setStatusMessage(`Connected to ${backendConfig.httpBase}. WebSocket active, WebRTC available.`);
       } else {
-        setStatusMessage('Connected to backend. WebSocket active, WebRTC unavailable on server.');
+        setStatusMessage(`Connected to ${backendConfig.httpBase}. WebSocket active, WebRTC unavailable on server.`);
       }
     } catch (err) {
       console.warn('Capabilities probe failed:', err);
       setCapabilities({ loaded: true, webrtc: false });
-      setStatusMessage('Backend capabilities probe failed. Running in WebSocket mode.');
+      setStatusMessage('Capabilities probe failed. Running in WebSocket mode.');
     }
-  }, []);
+  }, [backendConfig.capabilitiesUrl, backendConfig.httpBase]);
 
   const connectWebSocket = useCallback(() => {
     const existing = wsRef.current;
@@ -189,7 +335,15 @@ function App() {
       return;
     }
 
-    const ws = new WebSocket(SERVER_WS);
+    let ws;
+    try {
+      ws = new WebSocket(backendConfig.wsUrl);
+    } catch (err) {
+      console.error('Invalid WebSocket URL:', err);
+      setStatusMessage(`Invalid backend target: ${backendConfig.input}`);
+      return;
+    }
+
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -197,7 +351,7 @@ function App() {
       setWsConnected(true);
       setStatusMessage((prev) => {
         if (prev.includes('WebRTC active')) return prev;
-        return 'WebSocket connected. Ready for control input.';
+        return `WebSocket connected to ${backendConfig.wsUrl}. Ready for control input.`;
       });
     };
 
@@ -209,9 +363,9 @@ function App() {
     ws.onerror = (err) => {
       console.error('WebSocket error:', err);
       if (unmountedRef.current) return;
-      setStatusMessage('WebSocket connection issue. Retrying...');
+      setStatusMessage(`WebSocket connection issue at ${backendConfig.wsUrl}. Retrying...`);
     };
-  }, []);
+  }, [backendConfig.input, backendConfig.wsUrl]);
 
   // -- WebRTC Logic --
   const connectWebRTC = async () => {
@@ -256,7 +410,7 @@ function App() {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      const res = await fetch(`${SERVER_HTTP}/offer`, {
+      const res = await fetch(backendConfig.offerUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
@@ -275,15 +429,30 @@ function App() {
 
   useEffect(() => {
     unmountedRef.current = false;
-    fetchCapabilities();
-    connectWebSocket();
 
     return () => {
       unmountedRef.current = true;
       disconnectWebRTC();
       disconnectWebSocket();
     };
-  }, [connectWebSocket, disconnectWebRTC, disconnectWebSocket, fetchCapabilities]);
+  }, [disconnectWebRTC, disconnectWebSocket]);
+
+  useEffect(() => {
+    if (unmountedRef.current) return;
+
+    setStatusMessage(`Connecting to backend at ${backendConfig.httpBase} ...`);
+    setCapabilities({ loaded: false, webrtc: false });
+    disconnectWebRTC();
+    disconnectWebSocket();
+    fetchCapabilities();
+    connectWebSocket();
+  }, [
+    backendConfig.httpBase,
+    connectWebSocket,
+    disconnectWebRTC,
+    disconnectWebSocket,
+    fetchCapabilities,
+  ]);
 
   useEffect(() => {
     const getFullscreenElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
@@ -349,7 +518,12 @@ function App() {
   // 50Hz Control Loop over preferred channel
   useEffect(() => {
     const interval = setInterval(() => {
-      const payload = JSON.stringify({ vx: vxRef.current, omega: omegaRef.current });
+      const payload = JSON.stringify({
+        vx: vxRef.current,
+        omega: omegaRef.current,
+        pitch_cmd: pitchCmdRef.current,
+        roll_cmd: rollCmdRef.current,
+      });
       
       // Prefer WebRTC Data Channel if ready, else fallback to WebSocket
       if (webrtcConnected && dcRef.current && dcRef.current.readyState === 'open') {
@@ -370,17 +544,21 @@ function App() {
     return () => clearInterval(interval);
   }, [webrtcConnected, wsConnected]);
 
-  const handleLeftJoystick = useCallback((x) => {
+  const handleLeftJoystick = useCallback((x, y) => {
     const maxOmega = 3.0 * DEFAULT_JOYSTICK_GAIN;
-    const normalized = clamp(-x, -1, 1);
-    omegaRef.current = normalized * maxOmega * yawSensitivity;
-  }, [yawSensitivity]);
+    const maxVelocity = 5.0 * DEFAULT_JOYSTICK_GAIN;
+    const normalizedYaw = clamp(-x, -1, 1);
+    const normalizedVelocity = clamp(-y, -1, 1);
+
+    omegaRef.current = normalizedYaw * maxOmega * yawSensitivity;
+    vxRef.current = normalizedVelocity * maxVelocity * velocitySensitivity;
+  }, [yawSensitivity, velocitySensitivity]);
 
   const handleRightJoystick = useCallback((x, y) => {
-    const maxVelocity = 5.0 * DEFAULT_JOYSTICK_GAIN;
-    const normalized = clamp(-y, -1, 1);
-    vxRef.current = normalized * maxVelocity * velocitySensitivity;
-  }, [velocitySensitivity]);
+    // Right stick drives normalized body tilt setpoints consumed by the sim.
+    rollCmdRef.current = clamp(x, -1, 1);
+    pitchCmdRef.current = clamp(-y, -1, 1);
+  }, []);
 
   const toggleFullscreen = useCallback(async () => {
     const target = appRef.current || document.documentElement;
@@ -433,6 +611,90 @@ function App() {
     >
       <h1>Robot Remote Controller</h1>
       <p style={{ margin: '0 0 1rem', color: 'var(--text)' }}>{statusMessage}</p>
+
+      <div
+        style={{
+          margin: '0 auto 1rem',
+          width: 'min(840px, 96vw)',
+          border: '1px solid var(--border)',
+          borderRadius: 12,
+          padding: '1rem',
+          display: 'grid',
+          gap: '0.7rem',
+          textAlign: 'left',
+          background: 'var(--code-bg)'
+        }}
+      >
+        <div style={{ fontWeight: 600 }}>Backend Target</div>
+
+        <div style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap', alignItems: 'center' }}>
+          <input
+            type="text"
+            value={backendInput}
+            onChange={(event) => setBackendInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                applyBackendTarget();
+              }
+            }}
+            placeholder="192.168.1.25:8000 or https://robot.example.com"
+            style={{
+              flex: '1 1 20rem',
+              minWidth: 220,
+              padding: '0.55rem 0.65rem',
+              border: '1px solid var(--border)',
+              borderRadius: 8,
+              fontSize: '0.95rem',
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+              background: 'var(--bg)',
+              color: 'var(--text-h)'
+            }}
+          />
+
+          <button
+            onClick={applyBackendTarget}
+            style={{
+              padding: '0.55rem 0.85rem',
+              border: '1px solid var(--border)',
+              borderRadius: 8,
+              background: 'var(--social-bg)',
+              color: 'var(--text-h)',
+              cursor: 'pointer'
+            }}
+          >
+            Apply backend
+          </button>
+
+          <button
+            onClick={() => setBackendInput(getDefaultBackendTarget())}
+            style={{
+              padding: '0.55rem 0.85rem',
+              border: '1px solid var(--border)',
+              borderRadius: 8,
+              background: 'var(--social-bg)',
+              color: 'var(--text-h)',
+              cursor: 'pointer'
+            }}
+          >
+            Use local default
+          </button>
+        </div>
+
+        <div style={{ fontSize: '0.92rem', color: 'var(--text)' }}>
+          Active backend: {backendConfig.httpBase}
+        </div>
+
+        <div style={{ fontSize: '0.84rem', color: 'var(--text)' }}>
+          Tip: share a preconfigured link like <code>?backend=192.168.1.25:8000</code>
+        </div>
+
+        {backendConfig.usingInsecureBackendFromHttpsPage ? (
+          <div style={{ fontSize: '0.84rem', color: '#b45309' }}>
+            This page is HTTPS but the backend target is HTTP. Browsers will block mixed-content requests; use an HTTPS/WSS backend URL.
+          </div>
+        ) : null}
+      </div>
       
       <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem', marginBottom: '2rem' }}>
         <button
@@ -499,7 +761,7 @@ function App() {
         <div style={{ fontWeight: 600 }}>Sensitivity</div>
 
         <label style={{ display: 'grid', gap: '0.4rem' }}>
-          <span>Velocity (R, Y): {velocitySensitivity.toFixed(1)}x</span>
+          <span>Velocity (L, Y): {velocitySensitivity.toFixed(1)}x</span>
           <input
             type="range"
             min="0.2"
@@ -543,8 +805,8 @@ function App() {
       </div>
 
       <div style={panelStyle}>
-        <Joystick label="Yaw (L, X axis)" color="#1f77b4" onChange={handleLeftJoystick} size={joystickSize} />
-        <Joystick label="Velocity (R, Y axis)" color="#c0392b" onChange={handleRightJoystick} size={joystickSize} />
+        <Joystick label="Drive + Yaw (L, X/Y axes)" color="#1f77b4" onChange={handleLeftJoystick} size={joystickSize} />
+        <Joystick label="Pitch + Roll (R, X/Y axes)" color="#c0392b" onChange={handleRightJoystick} size={joystickSize} />
       </div>
     </div>
   );

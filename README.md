@@ -2,29 +2,26 @@
 
 Web controller for the gdog simulator.
 
-This app sends control commands at 50 Hz to the simulator backend on port 8000.
+The app sends drive and posture commands at 50 Hz to the simulator backend and works on desktop or phone.
 
 ## Features
 
-- Two virtual joysticks with pointer, mouse, and touch support
-- Correct dual-stick control mapping:
-  - Left joystick (`X`) controls yaw rate (`omega`)
-  - Right joystick (`Y`) controls forward/back velocity (`vx`)
-- Strong default response (amplified base joystick gain)
-- Independent sensitivity sliders for velocity and yaw
-- Auto WebSocket connection on page load
-- Optional WebRTC control channel when backend supports it
-- Backend capability probe via `/capabilities`
-- Fullscreen toggle to maximize joystick area on mobile
-- Dynamic joystick sizing in fullscreen
-- Dark-mode-aware UI (follows system/browser theme)
-- Multi-touch gesture suppression to avoid pinch/two-finger interference while driving
+- Two virtual joysticks (pointer, mouse, touch)
+- Control mapping:
+  - Left stick: forward/back (`vx`) + yaw (`omega`)
+  - Right stick: pitch/roll normalized commands (`pitch_cmd`, `roll_cmd`)
+- Sensitivity sliders for velocity and yaw
+- WebSocket default transport with optional WebRTC data channel
+- Backend target UI where you can type IP/host (for example `192.168.1.25:8000`)
+- URL parameter override via `?backend=...`
+- Backend target persistence in local storage
+- Fullscreen mode and mobile gesture suppression for better two-thumb control
 
 ## Prerequisites
 
 - Node.js 20+
 - npm
-- Simulator backend running from the sibling repository on `http://localhost:8000`
+- Simulator backend running from sibling repo (`gdog-sim`)
 
 ## Install
 
@@ -32,39 +29,104 @@ This app sends control commands at 50 Hz to the simulator backend on port 8000.
 npm install
 ```
 
-## Run
+## Local Run
 
 ```bash
 npm run dev
 ```
 
-Open the URL shown by Vite, usually `http://localhost:5173`.
+Open the URL shown by Vite (usually `http://localhost:5173`).
+
+## Backend Target Configuration
+
+The controller now supports three ways to choose backend host:
+
+1. Type host/IP in the app and click "Apply backend"
+2. Open with query parameter: `?backend=192.168.1.25:8000`
+3. Reuse previously saved target from local storage
+
+Accepted backend input examples:
+
+- `192.168.1.25:8000`
+- `my-mac.local:8000`
+- `https://robot.example.com`
+- `http://10.0.0.5:8000`
+
+If no port is provided, port `8000` is added automatically.
+
+### Important HTTPS Note
+
+If this page is served over HTTPS (for example GitHub Pages), browsers block insecure backend requests.
+
+- HTTPS page + HTTP backend = blocked (mixed content)
+- Use HTTPS/WSS backend endpoint (reverse proxy or tunnel) when serving remote from GitHub Pages
 
 ## Control Model
 
-- Left joystick (`X`) controls angular velocity `omega`
-- Right joystick (`Y`) controls linear velocity `vx`
-- If WebRTC connects, commands are sent over data channel
-- Otherwise commands continue over WebSocket fallback
+- Left stick:
+  - `X` axis -> `omega`
+  - `Y` axis -> `vx`
+- Right stick:
+  - `X` axis -> `roll_cmd`
+  - `Y` axis -> `pitch_cmd` (inverted for natural up/down feel)
+- Preferred transport:
+  - WebRTC data channel if connected
+  - fallback to WebSocket
 
-## Mobile Notes
+## Deploy To GitHub Pages (Deploy From Branch)
 
-- Use `Fullscreen` for larger controls and better thumb reach
-- Two-finger/pinch browser gestures are blocked in-app to reduce accidental interference
-- Dark mode should apply to panels, buttons, and page background
+This repo is configured for branch-based Pages deployment.
+
+### One-time GitHub Settings
+
+1. Push this repository to GitHub.
+2. Open repository Settings -> Pages.
+3. Under "Build and deployment", set Source to "Deploy from a branch".
+4. Select branch `gh-pages` and folder `/ (root)`.
+5. Save.
+
+### Deploy Command
+
+```bash
+npm run deploy
+```
+
+What this does:
+
+- Runs `npm run build:pages` with Vite base path set to `/gdog-remote/`
+- Publishes `dist/` to the `gh-pages` branch
+
+After deploy, your site URL will be similar to:
+
+- `https://<github-user>.github.io/gdog-remote/`
+
+Open with backend query parameter when needed:
+
+- `https://<github-user>.github.io/gdog-remote/?backend=192.168.1.25:8000`
+
+## If Your Repository Name Is Different
+
+The default `build:pages` script assumes repository name `gdog-remote`.
+If your repo name differs, update `build:pages` in [package.json](package.json).
+
+Example:
+
+```json
+"build:pages": "vite build --base /my-repo-name/"
+```
 
 ## Troubleshooting
 
-- White page at startup:
-  - Open browser devtools and check console errors
-  - Ensure dependencies were installed with `npm install`
-  - Make sure you are running `npm run dev` and not `nmp run dev`
-- Controls visible but robot does not move:
-  - Confirm simulator is running in the other repo
-  - Confirm backend is reachable at `http://localhost:8000/capabilities`
-  - Check status text in the UI for WebSocket or WebRTC connection state
-- WebRTC button disabled:
-  - Backend likely does not have `aiortc` installed
-  - Install optional dependency in the simulator repo and restart backend
-- UI appears stuck in old light colors on phone:
-  - Hard refresh once to invalidate cached CSS/JS
+- Phone opens remote but cannot connect:
+  - verify phone and Mac are on same network
+  - verify backend target is correct (`<mac-ip>:8000`)
+  - verify backend is running in gdog-sim
+- GitHub Pages loads but controls do nothing:
+  - likely mixed content (HTTPS page trying HTTP backend)
+  - use HTTPS/WSS backend URL (tunnel or reverse proxy)
+- WebRTC button stays disabled:
+  - backend `/capabilities` is currently missing in gdog-sim
+  - WebSocket mode is still expected to work
+- White page or stale UI:
+  - run `npm install`
+  - hard refresh browser cache
