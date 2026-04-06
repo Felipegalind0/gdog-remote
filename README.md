@@ -49,10 +49,14 @@ Accepted backend input examples:
 
 - `192.168.1.25:8000`
 - `my-mac.local:8000`
+- `https://my-random-name.trycloudflare.com`
 - `https://robot.example.com`
 - `http://10.0.0.5:8000`
 
-If no port is provided, port `8000` is added automatically.
+Port behavior:
+
+- Plain host input (`192.168.1.25` or `my-mac.local`) defaults to port `8000`
+- Explicit URL input (`https://...` or `http://...`) keeps URL-style defaults unless a port is explicitly included
 
 ### Important HTTPS Note
 
@@ -103,6 +107,7 @@ After deploy, your site URL will be similar to:
 Open with backend query parameter when needed:
 
 - `https://<github-user>.github.io/gdog-remote/?backend=192.168.1.25:8000`
+- `https://<github-user>.github.io/gdog-remote/?backend=https://my-random-name.trycloudflare.com`
 
 ## If Your Repository Name Is Different
 

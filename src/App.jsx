@@ -59,7 +59,9 @@ function normalizeBackendTarget(rawValue) {
   let token = String(rawValue || '').trim();
   let httpProtocol = defaultHttpProtocol;
   let wsProtocol = defaultWsProtocol;
-  let hostPort = '';
+  let parsedHost = '';
+  let parsedPort = '';
+  let portProvidedByInput = false;
   let explicitScheme = false;
 
   if (!token) {
@@ -77,7 +79,17 @@ function normalizeBackendTarget(rawValue) {
     explicitScheme = true;
     try {
       const parsed = new URL(token);
-      hostPort = (parsed.host || '').trim();
+      parsedHost = (parsed.hostname || '').trim();
+      parsedPort = (parsed.port || '').trim();
+      portProvidedByInput = parsedPort !== '';
+
+      // Accept accidental shorthand like https://host/8000 as host:8000.
+      const pathPortMatch = /^\/(\d{2,5})\/?$/.exec(parsed.pathname || '');
+      if (!parsedPort && pathPortMatch) {
+        parsedPort = pathPortMatch[1];
+        portProvidedByInput = true;
+      }
+
       if (parsed.protocol === 'https:' || parsed.protocol === 'wss:') {
         httpProtocol = 'https:';
         wsProtocol = 'wss:';
@@ -86,23 +98,72 @@ function normalizeBackendTarget(rawValue) {
         wsProtocol = 'ws:';
       }
     } catch {
-      hostPort = fallbackHostPort;
       explicitScheme = false;
     }
-  } else {
-    hostPort = token.replace(/^\/+|\/+$/g, '');
   }
 
-  if (!hostPort) {
-    hostPort = fallbackHostPort;
+  if (!parsedHost) {
+    const tokenNoScheme = token.replace(/^[a-z]+:\/\//i, '').trim();
+    const normalizedNoScheme = tokenNoScheme.replace(/^\/+|\/+$/g, '');
+
+    try {
+      const parsedNoScheme = new URL(`http://${normalizedNoScheme}`);
+      parsedHost = (parsedNoScheme.hostname || '').trim();
+      parsedPort = (parsedNoScheme.port || '').trim();
+      portProvidedByInput = parsedPort !== '';
+
+      // Accept shorthand like host/8000.
+      const pathPortMatch = /^\/(\d{2,5})\/?$/.exec(parsedNoScheme.pathname || '');
+      if (!parsedPort && pathPortMatch) {
+        parsedPort = pathPortMatch[1];
+        portProvidedByInput = true;
+      }
+    } catch {
+      const slashPortMatch = /^([^/]+)\/(\d{2,5})$/.exec(normalizedNoScheme);
+      if (slashPortMatch) {
+        parsedHost = slashPortMatch[1].trim();
+        parsedPort = slashPortMatch[2].trim();
+        portProvidedByInput = true;
+      } else {
+        parsedHost = normalizedNoScheme;
+      }
+    }
   }
 
-  const hasPort = hostPort.startsWith('[')
-    ? hostPort.includes(']:')
-    : hostPort.includes(':');
-  if (!hasPort) {
-    hostPort = `${hostPort}:${DEFAULT_BACKEND_PORT}`;
+  if (!parsedHost) {
+    try {
+      const fallbackParsed = new URL(`http://${fallbackHostPort}`);
+      parsedHost = (fallbackParsed.hostname || '').trim();
+      parsedPort = (fallbackParsed.port || '').trim();
+    } catch {
+      parsedHost = 'localhost';
+      parsedPort = String(DEFAULT_BACKEND_PORT);
+    }
   }
+
+  parsedHost = parsedHost.replace(/^\[|\]$/g, '');
+
+  let finalPort = parsedPort;
+  if (finalPort) {
+    const numericPort = Number.parseInt(finalPort, 10);
+    if (!Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) {
+      finalPort = '';
+    } else {
+      finalPort = String(numericPort);
+    }
+  }
+
+  if (!finalPort && !explicitScheme) {
+    finalPort = String(DEFAULT_BACKEND_PORT);
+  }
+
+  if (!finalPort && explicitScheme && portProvidedByInput) {
+    // Fallback only when a bad explicit port was supplied.
+    finalPort = String(DEFAULT_BACKEND_PORT);
+  }
+
+  const hostForUrl = parsedHost.includes(':') ? `[${parsedHost}]` : parsedHost;
+  const hostPort = finalPort ? `${hostForUrl}:${finalPort}` : hostForUrl;
 
   const normalizedInput = explicitScheme ? `${httpProtocol}//${hostPort}` : hostPort;
   const httpBase = `${httpProtocol}//${hostPort}`;
@@ -279,36 +340,15 @@ function App() {
     setWsConnected(false);
   }, []);
 
-  const applyBackendTarget = useCallback(() => {
-    const normalized = normalizeBackendTarget(backendInput);
-    setBackendInput(normalized.input);
-    persistBackendTarget(normalized.input);
-
-    const currentNormalized = normalizeBackendTarget(backendTarget).input;
-    const targetChanged = normalized.input !== currentNormalized;
-
-    setCapabilities({ loaded: false, webrtc: false });
-    if (targetChanged) {
-      setBackendTarget(normalized.input);
-      setStatusMessage(`Switching backend to ${normalized.httpBase} ...`);
+  const fetchCapabilities = useCallback(async () => {
+    if (backendConfig.usingInsecureBackendFromHttpsPage) {
+      setCapabilities({ loaded: true, webrtc: false });
+      setStatusMessage(
+        'Blocked by browser security: this HTTPS page cannot call an HTTP backend. Use HTTPS/WSS for backend, or open the remote from local HTTP (npm run dev).'
+      );
       return;
     }
 
-    setStatusMessage(`Reconnecting to ${normalized.httpBase} ...`);
-    disconnectWebRTC();
-    disconnectWebSocket();
-    fetchCapabilities();
-    connectWebSocket();
-  }, [
-    backendInput,
-    backendTarget,
-    connectWebSocket,
-    disconnectWebRTC,
-    disconnectWebSocket,
-    fetchCapabilities,
-  ]);
-
-  const fetchCapabilities = useCallback(async () => {
     try {
       const res = await fetch(backendConfig.capabilitiesUrl);
       if (!res.ok) throw new Error(`status ${res.status}`);
@@ -327,9 +367,17 @@ function App() {
       setCapabilities({ loaded: true, webrtc: false });
       setStatusMessage('Capabilities probe failed. Running in WebSocket mode.');
     }
-  }, [backendConfig.capabilitiesUrl, backendConfig.httpBase]);
+  }, [backendConfig.capabilitiesUrl, backendConfig.httpBase, backendConfig.usingInsecureBackendFromHttpsPage]);
 
   const connectWebSocket = useCallback(() => {
+    if (backendConfig.usingInsecureBackendFromHttpsPage) {
+      setWsConnected(false);
+      setStatusMessage(
+        'Blocked by browser security: this HTTPS page cannot open ws:// backends. Use HTTPS/WSS backend, or open the remote from local HTTP (npm run dev).'
+      );
+      return;
+    }
+
     const existing = wsRef.current;
     if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
       return;
@@ -363,12 +411,52 @@ function App() {
     ws.onerror = (err) => {
       console.error('WebSocket error:', err);
       if (unmountedRef.current) return;
-      setStatusMessage(`WebSocket connection issue at ${backendConfig.wsUrl}. Retrying...`);
+      let hint = '';
+      if (backendConfig.wsUrl.startsWith('wss://')) {
+        hint = ' If this is direct LAN gdog-sim, use the HTTP remote (npm run dev) or put backend behind HTTPS/WSS.';
+      }
+      setStatusMessage(`WebSocket connection issue at ${backendConfig.wsUrl}. Retrying...${hint}`);
     };
-  }, [backendConfig.input, backendConfig.wsUrl]);
+  }, [backendConfig.input, backendConfig.usingInsecureBackendFromHttpsPage, backendConfig.wsUrl]);
+
+  const applyBackendTarget = useCallback(() => {
+    const normalized = normalizeBackendTarget(backendInput);
+    setBackendInput(normalized.input);
+    persistBackendTarget(normalized.input);
+
+    const currentNormalized = normalizeBackendTarget(backendTarget).input;
+    const targetChanged = normalized.input !== currentNormalized;
+
+    setCapabilities({ loaded: false, webrtc: false });
+    if (targetChanged) {
+      setBackendTarget(normalized.input);
+      setStatusMessage(`Switching backend to ${normalized.httpBase} ...`);
+      return;
+    }
+
+    setStatusMessage(`Reconnecting to ${normalized.httpBase} ...`);
+    disconnectWebRTC();
+    disconnectWebSocket();
+    fetchCapabilities();
+    connectWebSocket();
+  }, [
+    backendInput,
+    backendTarget,
+    connectWebSocket,
+    disconnectWebRTC,
+    disconnectWebSocket,
+    fetchCapabilities,
+  ]);
 
   // -- WebRTC Logic --
   const connectWebRTC = async () => {
+    if (backendConfig.usingInsecureBackendFromHttpsPage) {
+      setStatusMessage(
+        'Blocked by browser security: this HTTPS page cannot use HTTP backend for WebRTC signaling. Use HTTPS/WSS backend, or open remote over local HTTP.'
+      );
+      return;
+    }
+
     if (!capabilities.webrtc) {
       setStatusMessage('WebRTC is not available on the backend. Use WebSocket fallback.');
       return;
