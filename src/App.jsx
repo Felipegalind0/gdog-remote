@@ -313,6 +313,7 @@ function App() {
   const [voicePanelExpanded, setVoicePanelExpanded] = useState(false);
   const [pendingVoiceCommand, setPendingVoiceCommand] = useState(null);
   const [pendingVoiceElapsedSec, setPendingVoiceElapsedSec] = useState(0);
+  const [pendingVoiceProgress, setPendingVoiceProgress] = useState(null);
   const [statusMessage, setStatusMessage] = useState('Booting remote controller...');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [viewport, setViewport] = useState(() => ({ width: window.innerWidth, height: window.innerHeight }));
@@ -326,6 +327,7 @@ function App() {
   const openAiMicStreamRef = useRef(null);
   const openAiAudioRef = useRef(null);
   const pendingVoiceToolCallsRef = useRef(new Map());
+  const pendingVoiceCommandRef = useRef(null);
   const handledVoiceToolCallIdsRef = useRef(new Set());
   const unmountedRef = useRef(false);
 
@@ -401,6 +403,7 @@ function App() {
     window.clearTimeout(pending.timeoutId);
     pendingVoiceToolCallsRef.current.delete(key);
     setPendingVoiceCommand((current) => (current && current.callId === key ? null : current));
+    setPendingVoiceProgress((current) => (current && current.callId === key ? null : current));
     pending.resolve(resultPayload);
     return true;
   }, []);
@@ -418,6 +421,7 @@ function App() {
     }
     pendingVoiceToolCallsRef.current.clear();
     setPendingVoiceCommand(null);
+    setPendingVoiceProgress(null);
   }, []);
 
   const waitForVoiceToolResult = useCallback((callId, options = {}) => {
@@ -433,6 +437,7 @@ function App() {
     }
 
     return new Promise((resolve) => {
+      setPendingVoiceProgress(null);
       setPendingVoiceCommand({
         callId: key,
         summary,
@@ -443,6 +448,7 @@ function App() {
       const timeoutId = window.setTimeout(() => {
         pendingVoiceToolCallsRef.current.delete(key);
         setPendingVoiceCommand((current) => (current && current.callId === key ? null : current));
+        setPendingVoiceProgress((current) => (current && current.callId === key ? null : current));
         resolve({
           type: 'voice_command_result',
           call_id: key,
@@ -454,6 +460,10 @@ function App() {
       pendingVoiceToolCallsRef.current.set(key, { resolve, timeoutId });
     });
   }, []);
+
+  useEffect(() => {
+    pendingVoiceCommandRef.current = pendingVoiceCommand;
+  }, [pendingVoiceCommand]);
 
   useEffect(() => {
     if (!pendingVoiceCommand) {
@@ -482,6 +492,25 @@ function App() {
     try {
       message = JSON.parse(rawPayload);
     } catch {
+      return;
+    }
+
+    if (message?.type === 'voice_command_progress') {
+      const callId = String(message.call_id || '').trim();
+      if (!callId) {
+        return;
+      }
+      const activeCallId = pendingVoiceCommandRef.current?.callId || null;
+
+      setPendingVoiceProgress((current) => {
+        if (activeCallId && activeCallId === callId) {
+          return { callId, payload: message };
+        }
+        if (current && current.callId === callId) {
+          return { callId, payload: message };
+        }
+        return current;
+      });
       return;
     }
 
@@ -1237,6 +1266,67 @@ function App() {
     marginTop: isFullscreen ? '0.8rem' : '1.5rem'
   };
 
+  const pendingVoiceRemainingSec = pendingVoiceCommand
+    ? Math.max(0, (pendingVoiceCommand.timeoutMs / 1000) - pendingVoiceElapsedSec)
+    : 0;
+
+  const pendingVoiceProgressView = useMemo(() => {
+    if (!pendingVoiceCommand) {
+      return null;
+    }
+    if (!pendingVoiceProgress || pendingVoiceProgress.callId !== pendingVoiceCommand.callId) {
+      return null;
+    }
+
+    const payload = pendingVoiceProgress.payload || {};
+    const command = String(payload.command || '').trim().toLowerCase();
+    const ratioRaw = Number(payload.progress_ratio);
+    const direction = String(payload.direction || '').trim().toLowerCase();
+    const directionText = direction ? `${direction} ` : '';
+
+    if (command === 'move') {
+      const target = Math.max(0, Number(payload.target_m) || 0);
+      const progress = Math.max(0, Number(payload.progress_m) || 0);
+      const remainingRaw = Number(payload.remaining_m);
+      const remainingFallback = target > 0 ? Math.max(target - progress, 0) : 0;
+      const remaining = Number.isFinite(remainingRaw) ? Math.max(0, remainingRaw) : remainingFallback;
+      const ratio = Number.isFinite(ratioRaw)
+        ? clamp(ratioRaw, 0, 1)
+        : (target > 0 ? clamp(progress / target, 0, 1) : 0);
+
+      return {
+        ratio,
+        headline: `Progress: ${directionText}${progress.toFixed(2)}m / ${target.toFixed(2)}m (${(ratio * 100).toFixed(0)}%)`,
+        remaining: `${remaining.toFixed(2)}m remaining`,
+      };
+    }
+
+    if (command === 'rotate') {
+      const targetDegRaw = Number(payload.target_deg);
+      const progressDegRaw = Number(payload.progress_deg);
+      const remainingDegRaw = Number(payload.remaining_deg);
+
+      const targetDegFallback = (Math.max(0, Number(payload.target_rad) || 0) * 180) / Math.PI;
+      const progressDegFallback = (Math.max(0, Number(payload.progress_rad) || 0) * 180) / Math.PI;
+      const remainingDegFallback = (Math.max(0, Number(payload.remaining_rad) || 0) * 180) / Math.PI;
+
+      const targetDeg = Number.isFinite(targetDegRaw) ? Math.max(0, targetDegRaw) : targetDegFallback;
+      const progressDeg = Number.isFinite(progressDegRaw) ? Math.max(0, progressDegRaw) : progressDegFallback;
+      const remainingDeg = Number.isFinite(remainingDegRaw) ? Math.max(0, remainingDegRaw) : remainingDegFallback;
+      const ratio = Number.isFinite(ratioRaw)
+        ? clamp(ratioRaw, 0, 1)
+        : (targetDeg > 0 ? clamp(progressDeg / targetDeg, 0, 1) : 0);
+
+      return {
+        ratio,
+        headline: `Progress: ${directionText}${progressDeg.toFixed(0)}deg / ${targetDeg.toFixed(0)}deg (${(ratio * 100).toFixed(0)}%)`,
+        remaining: `${remainingDeg.toFixed(0)}deg remaining`,
+      };
+    }
+
+    return null;
+  }, [pendingVoiceCommand, pendingVoiceProgress]);
+
   const callButtonBusy = voiceSessionConnecting;
   const callButtonOn = voiceSessionActive || voiceSessionConnecting;
   const callButtonLabel = callButtonOn ? (callButtonBusy ? '📴 End Call (connecting...)' : '📴 End Call') : '📞 Start Call';
@@ -1428,8 +1518,40 @@ function App() {
         </div>
 
         {pendingVoiceCommand ? (
-          <div style={{ fontSize: '0.84rem', color: 'var(--text)' }}>
-            Waiting on robot: {pendingVoiceCommand.summary} · {pendingVoiceElapsedSec.toFixed(1)}s / {(pendingVoiceCommand.timeoutMs / 1000).toFixed(0)}s ⏱️
+          <div style={{ fontSize: '0.84rem', color: 'var(--text)', display: 'grid', gap: '0.35rem' }}>
+            <div>
+              Waiting on robot: {pendingVoiceCommand.summary}
+            </div>
+            <div>
+              Timer: {pendingVoiceElapsedSec.toFixed(1)}s elapsed / {(pendingVoiceCommand.timeoutMs / 1000).toFixed(0)}s limit · {pendingVoiceRemainingSec.toFixed(1)}s remaining ⏱️
+            </div>
+
+            {pendingVoiceProgressView ? (
+              <>
+                <div>
+                  {pendingVoiceProgressView.headline} · {pendingVoiceProgressView.remaining}
+                </div>
+                <div
+                  style={{
+                    height: 8,
+                    borderRadius: 999,
+                    background: 'var(--social-bg)',
+                    overflow: 'hidden',
+                  }}
+                >
+                  <div
+                    style={{
+                      width: `${(pendingVoiceProgressView.ratio * 100).toFixed(1)}%`,
+                      height: '100%',
+                      background: 'linear-gradient(90deg, #34d399, #10b981)',
+                      transition: 'width 120ms linear',
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              <div>Progress: waiting for robot telemetry...</div>
+            )}
           </div>
         ) : null}
       </div>
