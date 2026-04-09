@@ -1420,10 +1420,9 @@ function App() {
             </div>
           </>
         ) : (
-          <div style={{ fontSize: '0.84rem', color: 'var(--text)' }}>
-            Voice key panel is minimized by default. Use the call button above and show the key field only when needed.
-          </div>
+   
         )}
+        {/* Voice key panel is minimized by default. Use the call button above and show the key field only when needed. */}
 
         <div style={{ fontSize: '0.84rem', color: 'var(--text)' }}>
           Realtime session: {voiceSessionConnecting ? 'connecting...' : voiceSessionActive ? 'active' : 'idle'}
