@@ -335,6 +335,7 @@ function App() {
   const openAiMicStreamRef = useRef(null);
   const openAiAudioRef = useRef(null);
   const pendingVoiceToolCallsRef = useRef(new Map());
+  const pendingVoiceProgressStartRef = useRef(new Map());
   const pendingVoiceCommandRef = useRef(null);
   const handledVoiceToolCallIdsRef = useRef(new Set());
   const unmountedRef = useRef(false);
@@ -498,6 +499,27 @@ function App() {
     return true;
   }, []);
 
+  const resolvePendingVoiceProgressStart = useCallback((callId, progressPayload = null) => {
+    const key = String(callId || '').trim();
+    if (!key) return false;
+
+    const pending = pendingVoiceProgressStartRef.current.get(key);
+    if (!pending) return false;
+
+    window.clearTimeout(pending.timeoutId);
+    pendingVoiceProgressStartRef.current.delete(key);
+    pending.resolve(progressPayload);
+    return true;
+  }, []);
+
+  const clearPendingVoiceProgressStartWaiters = useCallback(() => {
+    for (const pending of pendingVoiceProgressStartRef.current.values()) {
+      window.clearTimeout(pending.timeoutId);
+      pending.resolve(null);
+    }
+    pendingVoiceProgressStartRef.current.clear();
+  }, []);
+
   const clearPendingVoiceToolCalls = useCallback((reason = 'Voice command interrupted before completion.') => {
     const fallbackResult = {
       type: 'voice_command_result',
@@ -539,6 +561,7 @@ function App() {
 
       const timeoutId = window.setTimeout(() => {
         pendingVoiceToolCallsRef.current.delete(key);
+        resolvePendingVoiceProgressStart(key, null);
         setPendingVoiceCommand((current) => (current && current.callId === key ? null : current));
         setPendingVoiceProgress((current) => (current && current.callId === key ? null : current));
         addLog(`Command [${key}] timed out waiting for robot telemetry.`, 'error');
@@ -552,7 +575,47 @@ function App() {
 
       pendingVoiceToolCallsRef.current.set(key, { resolve, timeoutId });
     });
-  }, [addLog]);
+  }, [addLog, resolvePendingVoiceProgressStart]);
+
+  const waitForVoiceProgressStart = useCallback((callId, options = {}) => {
+    const key = String(callId || '').trim();
+    const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 1000;
+    if (!key) {
+      return Promise.resolve(null);
+    }
+
+    return new Promise((resolve) => {
+      const existing = pendingVoiceProgressStartRef.current.get(key);
+      if (existing) {
+        window.clearTimeout(existing.timeoutId);
+        existing.resolve(null);
+      }
+
+      const timeoutId = window.setTimeout(() => {
+        pendingVoiceProgressStartRef.current.delete(key);
+        resolve(null);
+      }, timeoutMs);
+
+      pendingVoiceProgressStartRef.current.set(key, { resolve, timeoutId });
+    });
+  }, []);
+
+  const progressEventShowsMovement = useCallback((payload) => {
+    const command = String(payload?.command || '').trim().toLowerCase();
+    const ratio = Number(payload?.progress_ratio);
+
+    if (command === 'move') {
+      const progressM = Number(payload?.progress_m);
+      return progressM > 0.03 || ratio > 0.01;
+    }
+
+    if (command === 'rotate') {
+      const progressRad = Number(payload?.progress_rad);
+      return progressRad > ((2 * Math.PI) / 180) || ratio > 0.01;
+    }
+
+    return ratio > 0.01;
+  }, []);
 
   useEffect(() => {
     pendingVoiceCommandRef.current = pendingVoiceCommand;
@@ -594,6 +657,11 @@ function App() {
       if (!callId) {
         return;
       }
+
+      if (progressEventShowsMovement(message)) {
+        resolvePendingVoiceProgressStart(callId, message);
+      }
+
       const activeCallId = pendingVoiceCommandRef.current?.callId || null;
 
       setPendingVoiceProgress((current) => {
@@ -616,11 +684,13 @@ function App() {
     const reason = message.reason;
     addLog(`Command [${message.call_id}] finished: ${status}${reason ? ' - ' + reason : ''}`, status === 'completed' ? 'success' : 'error');
 
+    resolvePendingVoiceProgressStart(message.call_id, null);
     resolvePendingVoiceToolCall(message.call_id, message);
-  }, [resolvePendingVoiceToolCall, addLog]);
+  }, [resolvePendingVoiceToolCall, addLog, progressEventShowsMovement, resolvePendingVoiceProgressStart]);
 
   const stopVoiceControl = useCallback((statusOverride = null) => {
     clearPendingVoiceToolCalls('Voice session ended before command completion.');
+    clearPendingVoiceProgressStartWaiters();
     handledVoiceToolCallIdsRef.current.clear();
 
     const dataChannel = openAiDcRef.current;
@@ -678,7 +748,7 @@ function App() {
         setStatusMessage(statusOverride);
       }
     }
-  }, [clearPendingVoiceToolCalls]);
+  }, [clearPendingVoiceProgressStartWaiters, clearPendingVoiceToolCalls]);
 
   const sendVoiceRobotCommand = useCallback((voicePayload) => {
     return sendControlPayload({
@@ -689,6 +759,68 @@ function App() {
       ...voicePayload,
     }, { urgent: true });
   }, [sendControlPayload]);
+
+  const sendVoiceAssistantUpdate = useCallback((statusText) => {
+    const channel = openAiDcRef.current;
+    const text = String(statusText || '').trim();
+    if (!text || !channel || channel.readyState !== 'open') {
+      return false;
+    }
+
+    channel.send(JSON.stringify({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: `Robot status update: ${text} Reply in one short sentence and do not call tools for this update.`,
+          },
+        ],
+      },
+    }));
+    channel.send(JSON.stringify({
+      type: 'response.create',
+      response: {
+        modalities: ['audio', 'text'],
+        instructions: 'Acknowledge the robot status update in one short sentence. Do not call tools.',
+      },
+    }));
+    return true;
+  }, []);
+
+  const monitorVoiceCommandOutcome = useCallback((intentText, resultPromise) => {
+    Promise.resolve(resultPromise)
+      .then((result) => {
+        const status = String(result?.status || 'failed').toLowerCase();
+        const reason = String(result?.reason || '').trim();
+
+        if (status === 'completed') {
+          sendVoiceAssistantUpdate(`The robot completed the command to ${intentText}.`);
+          return;
+        }
+
+        const stuckForSec = Number(result?.stuck_for_s) || 0;
+        const reasonLower = reason.toLowerCase();
+        const looksStuck = (
+          stuckForSec >= 2.0
+          || reasonLower.includes('stuck')
+          || reasonLower.includes('blocked')
+          || reasonLower.includes('stopped making progress')
+        );
+
+        if (looksStuck) {
+          sendVoiceAssistantUpdate(`That did not work. The robot got stuck for more than 2 seconds while trying to ${intentText}.`);
+        } else {
+          const suffix = reason ? ` Reason: ${reason}` : '';
+          sendVoiceAssistantUpdate(`That did not work while trying to ${intentText}.${suffix}`);
+        }
+      })
+      .catch((err) => {
+        addLog(`Failed to monitor command outcome: ${err?.message || String(err)}`, 'error');
+      });
+  }, [addLog, sendVoiceAssistantUpdate]);
 
   const fetchCapabilities = useCallback(async () => {
     if (backendConfig.usingInsecureBackendFromHttpsPage) {
@@ -1143,11 +1275,13 @@ function App() {
                 ? 'backward'
                 : 'forward';
               const distanceMeters = clamp(Math.abs(Number(args.distance) || 0), 0.05, 10.0);
+              const intentText = `move ${direction} ${distanceMeters.toFixed(2)} meters`;
               const waitTimeoutMs = Math.max(45000, 20000 + (distanceMeters * 15000));
               const resultPromise = waitForVoiceToolResult(normalizedCallId, {
                 summary: `move ${direction} ${distanceMeters.toFixed(2)} m`,
                 timeoutMs: waitTimeoutMs,
               });
+              const progressStartPromise = waitForVoiceProgressStart(normalizedCallId, { timeoutMs: 1000 });
               const sent = sendVoiceRobotCommand({
                 voice_cmd: 'move',
                 direction,
@@ -1156,6 +1290,7 @@ function App() {
               });
 
               if (!sent) {
+                resolvePendingVoiceProgressStart(normalizedCallId, null);
                 resolvePendingVoiceToolCall(normalizedCallId, {
                   type: 'voice_command_result',
                   call_id: normalizedCallId,
@@ -1163,19 +1298,38 @@ function App() {
                   status: 'failed',
                   reason: 'Robot transport is not connected.',
                 });
-              }
+                output = {
+                  success: false,
+                  command: 'move',
+                  direction,
+                  distance_m: distanceMeters,
+                  status: 'failed',
+                  reason: 'Robot transport is not connected.',
+                };
+              } else {
+                const firstProgress = await progressStartPromise;
+                monitorVoiceCommandOutcome(intentText, resultPromise);
 
-              const result = await resultPromise;
-              const status = String(result?.status || 'failed');
-              output = {
-                success: status === 'completed',
-                command: 'move',
-                direction,
-                distance_m: distanceMeters,
-                status,
-                reason: result?.reason || '',
-                result,
-              };
+                if (firstProgress) {
+                  output = {
+                    success: true,
+                    command: 'move',
+                    direction,
+                    distance_m: distanceMeters,
+                    status: 'started',
+                    message: `Robot is moving ${direction} ${distanceMeters.toFixed(2)} meters.`,
+                  };
+                } else {
+                  output = {
+                    success: false,
+                    command: 'move',
+                    direction,
+                    distance_m: distanceMeters,
+                    status: 'failed',
+                    reason: 'Robot did not start making progress within 1 second.',
+                  };
+                }
+              }
             } else if (toolName === 'rotate') {
               const directionRaw = String(args.direction || '').trim().toLowerCase();
               const direction = directionRaw === 'right' || directionRaw === 'r' || directionRaw === 'cw' || directionRaw === 'clockwise'
@@ -1183,11 +1337,13 @@ function App() {
                 : 'left';
               const degrees = clamp(Math.abs(Number(args.degrees) || 0), 1.0, 720.0);
               const radians = (degrees * Math.PI) / 180.0;
+              const intentText = `rotate ${degrees.toFixed(0)} degrees to the ${direction}`;
               const waitTimeoutMs = Math.max(45000, 20000 + (degrees * 250));
               const resultPromise = waitForVoiceToolResult(normalizedCallId, {
                 summary: `rotate ${direction} ${degrees.toFixed(0)} deg`,
                 timeoutMs: waitTimeoutMs,
               });
+              const progressStartPromise = waitForVoiceProgressStart(normalizedCallId, { timeoutMs: 1000 });
               const sent = sendVoiceRobotCommand({
                 voice_cmd: 'rotate',
                 direction,
@@ -1196,6 +1352,7 @@ function App() {
               });
 
               if (!sent) {
+                resolvePendingVoiceProgressStart(normalizedCallId, null);
                 resolvePendingVoiceToolCall(normalizedCallId, {
                   type: 'voice_command_result',
                   call_id: normalizedCallId,
@@ -1203,19 +1360,38 @@ function App() {
                   status: 'failed',
                   reason: 'Robot transport is not connected.',
                 });
-              }
+                output = {
+                  success: false,
+                  command: 'rotate',
+                  direction,
+                  degrees,
+                  status: 'failed',
+                  reason: 'Robot transport is not connected.',
+                };
+              } else {
+                const firstProgress = await progressStartPromise;
+                monitorVoiceCommandOutcome(intentText, resultPromise);
 
-              const result = await resultPromise;
-              const status = String(result?.status || 'failed');
-              output = {
-                success: status === 'completed',
-                command: 'rotate',
-                direction,
-                degrees,
-                status,
-                reason: result?.reason || '',
-                result,
-              };
+                if (firstProgress) {
+                  output = {
+                    success: true,
+                    command: 'rotate',
+                    direction,
+                    degrees,
+                    status: 'started',
+                    message: `Robot is rotating ${degrees.toFixed(0)} degrees to the ${direction}.`,
+                  };
+                } else {
+                  output = {
+                    success: false,
+                    command: 'rotate',
+                    direction,
+                    degrees,
+                    status: 'failed',
+                    reason: 'Robot did not start making progress within 1 second.',
+                  };
+                }
+              }
             } else if (toolName === 'respawn') {
               const sent = sendVoiceRobotCommand({
                 cmd: 'respawn',
@@ -1269,7 +1445,7 @@ function App() {
         dc.send(JSON.stringify({
           type: 'session.update',
           session: {
-            instructions: 'You control a robot. Use move for forward/backward distance in meters, rotate for left/right angle in degrees, and respawn if the robot tips over or is unrecoverable. Tool outputs arrive only after execution completes or fails, so describe the actual outcome briefly.',
+            instructions: 'You control a robot. Use move for forward/backward distance in meters, rotate for left/right angle in degrees, and respawn if the robot tips over or is unrecoverable. Tool outputs acknowledge motion start after up to 1 second, and separate status updates may arrive when commands complete or fail.',
             tools: [
               {
                 type: 'function',
