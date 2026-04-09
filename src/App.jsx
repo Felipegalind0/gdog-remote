@@ -199,6 +199,63 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function formatRuntimeHardwareContext(runtimeInfo) {
+  const info = runtimeInfo && typeof runtimeInfo === 'object' ? runtimeInfo : null;
+  if (!info) {
+    return 'The backend runtime hardware report is currently unavailable.';
+  }
+
+  const summary = info.summary && typeof info.summary === 'object' ? info.summary : {};
+  const detailLines = [
+    ['OS', summary.os],
+    ['Host', summary.host],
+    ['Kernel', summary.kernel],
+    ['CPU', summary.cpu],
+    ['GPU', summary.gpu],
+    ['Memory', summary.memory],
+  ]
+    .filter(([, value]) => typeof value === 'string' && value.trim().length > 0)
+    .map(([label, value]) => `${label}: ${value.trim()}`);
+
+  if (detailLines.length > 0) {
+    return [
+      'The hardware Genesis is running on (captured at backend launch via neofetch):',
+      ...detailLines,
+    ].join('\n');
+  }
+
+  const rawText = String(info.raw || '').trim();
+  if (rawText) {
+    const clipped = rawText.split('\n').slice(0, 24).join('\n');
+    return [
+      'The backend captured this neofetch output at launch:',
+      clipped,
+    ].join('\n');
+  }
+
+  const errorText = String(info.error || '').trim();
+  if (errorText) {
+    return `The backend attempted to run neofetch at launch, but it failed: ${errorText}`;
+  }
+
+  return 'The backend attempted to run neofetch at launch, but no hardware details were reported.';
+}
+
+function buildGoldyDogInstructions(runtimeInfo, controlDirective) {
+  const controlText = String(controlDirective || '').trim();
+  const sections = [
+    "You refer to yourself as 'GoldyDog', an Open Source robot dog the size of spot-micro, with brushless motors, wheels and IMUs at the tips of the legs for terrain sensing.",
+    "You are currently inside of a High Fidelity physics simulation powered by Genesis, the world's fastest physics engine.",
+    formatRuntimeHardwareContext(runtimeInfo),
+  ];
+
+  if (controlText) {
+    sections.push(controlText);
+  }
+
+  return sections.join('\n\n');
+}
+
 function Joystick({ label, color, onChange, size = 180 }) {
   const zoneRef = useRef(null);
   const pointerIdRef = useRef(null);
@@ -307,7 +364,7 @@ function App() {
   const [backendInput, setBackendInput] = useState(initialBackendInput);
   const [backendTarget, setBackendTarget] = useState(initialBackendInput);
   const [openAiKey, setOpenAiKey] = useState(() => getInitialOpenAiKey());
-  const [capabilities, setCapabilities] = useState({ loaded: false, webrtc: false });
+  const [capabilities, setCapabilities] = useState({ loaded: false, webrtc: false, runtimeInfo: null });
   const [webrtcConnected, setWebrtcConnected] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [httpFallbackActive, setHttpFallbackActive] = useState(false);
@@ -355,6 +412,14 @@ function App() {
   const rollCmdRef = useRef(0.0);
 
   const backendConfig = useMemo(() => normalizeBackendTarget(backendTarget), [backendTarget]);
+  const tokenRequestInstructions = useMemo(() => buildGoldyDogInstructions(
+    capabilities.runtimeInfo,
+    'Control the robot only with tools. Use move(direction, distance) for forward/backward meters. Use rotate(direction, degrees) for left/right turns in degrees. Use respawn() if the robot gets stuck or falls over. Never issue a new tool call until the previous tool call has returned.'
+  ), [capabilities.runtimeInfo]);
+  const sessionUpdateInstructions = useMemo(() => buildGoldyDogInstructions(
+    capabilities.runtimeInfo,
+    'You control a robot. Use move for forward/backward distance in meters, rotate for left/right angle in degrees, and respawn if the robot tips over or is unrecoverable. Wait for each tool output before calling another tool; never overlap tool calls.'
+  ), [capabilities.runtimeInfo]);
 
   const addLog = useCallback((message, type = 'info') => {
     const msg = String(message || '').trim();
@@ -1060,7 +1125,7 @@ function App() {
 
   const fetchCapabilities = useCallback(async () => {
     if (backendConfig.usingInsecureBackendFromHttpsPage) {
-      setCapabilities({ loaded: true, webrtc: false });
+      setCapabilities({ loaded: true, webrtc: false, runtimeInfo: null });
       setStatusMessage(
         'Blocked by browser security: this HTTPS page cannot call an HTTP backend. Use HTTPS/WSS for backend, or open the remote from local HTTP (npm run dev).'
       );
@@ -1073,7 +1138,10 @@ function App() {
       const data = await res.json();
 
       const webrtcAvailable = Boolean(data.webrtc);
-      setCapabilities({ loaded: true, webrtc: webrtcAvailable });
+      const runtimeInfo = (data && typeof data === 'object' && data.runtime_info && typeof data.runtime_info === 'object')
+        ? data.runtime_info
+        : null;
+      setCapabilities({ loaded: true, webrtc: webrtcAvailable, runtimeInfo });
 
       if (webrtcAvailable) {
         setStatusMessage(`Connected to ${backendConfig.httpBase}. WebRTC available. Attempting WebSocket connection...`);
@@ -1084,7 +1152,7 @@ function App() {
       }
     } catch (err) {
       console.warn('Capabilities probe failed:', err);
-      setCapabilities({ loaded: true, webrtc: false });
+      setCapabilities({ loaded: true, webrtc: false, runtimeInfo: null });
       setStatusMessage('Capabilities probe failed. Retrying WebSocket and falling back to HTTP commands if upgrades are blocked.');
       addLog(`Capabilities probe failed at ${backendConfig.capabilitiesUrl}: ${err?.message || String(err)}`, 'error');
     }
@@ -1461,7 +1529,7 @@ function App() {
           model: OPENAI_REALTIME_MODEL,
           voice: 'verse',
           modalities: ['audio', 'text'],
-          instructions: 'Control the robot only with tools. Use move(direction, distance) for forward/backward meters. Use rotate(direction, degrees) for left/right turns in degrees. Use respawn() if the robot gets stuck or falls over. Never issue a new tool call until the previous tool call has returned.',
+          instructions: tokenRequestInstructions,
         }),
       });
 
@@ -1693,7 +1761,7 @@ function App() {
         dc.send(JSON.stringify({
           type: 'session.update',
           session: {
-            instructions: 'You control a robot. Use move for forward/backward distance in meters, rotate for left/right angle in degrees, and respawn if the robot tips over or is unrecoverable. Wait for each tool output before calling another tool; never overlap tool calls.',
+            instructions: sessionUpdateInstructions,
             tools: [
               {
                 type: 'function',
