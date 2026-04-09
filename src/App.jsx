@@ -3,6 +3,8 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 const BACKEND_STORAGE_KEY = 'gdog.remote.backendTarget';
 const DEFAULT_BACKEND_PORT = 8000;
 const DEFAULT_JOYSTICK_GAIN = 5.0;
+const DEFAULT_MANUAL_MOVE_METERS = 0.75;
+const DEFAULT_MANUAL_TURN_DEGREES = 45.0;
 const OPENAI_REALTIME_MODEL = 'gpt-4o-realtime-preview-2024-12-17';
 const OPENAI_KEY_QUERY_KEYS = ['openai_key', 'openaiKey', 'api_key', 'apikey', 'key'];
 
@@ -316,6 +318,8 @@ function App() {
   const [pendingVoiceCommand, setPendingVoiceCommand] = useState(null);
   const [pendingVoiceElapsedSec, setPendingVoiceElapsedSec] = useState(0);
   const [pendingVoiceProgress, setPendingVoiceProgress] = useState(null);
+  const [manualMoveMeters, setManualMoveMeters] = useState(DEFAULT_MANUAL_MOVE_METERS);
+  const [manualTurnDegrees, setManualTurnDegrees] = useState(DEFAULT_MANUAL_TURN_DEGREES);
   const [statusMessage, setStatusMessage] = useState('Booting remote controller...');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [viewport, setViewport] = useState(() => ({ width: window.innerWidth, height: window.innerHeight }));
@@ -338,6 +342,7 @@ function App() {
   const pendingVoiceProgressStartRef = useRef(new Map());
   const pendingVoiceCommandRef = useRef(null);
   const handledVoiceToolCallIdsRef = useRef(new Set());
+  const activeRealtimeToolCallRef = useRef(null);
   const unmountedRef = useRef(false);
 
   const vxRef = useRef(0.0);
@@ -577,29 +582,6 @@ function App() {
     });
   }, [addLog, resolvePendingVoiceProgressStart]);
 
-  const waitForVoiceProgressStart = useCallback((callId, options = {}) => {
-    const key = String(callId || '').trim();
-    const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 1000;
-    if (!key) {
-      return Promise.resolve(null);
-    }
-
-    return new Promise((resolve) => {
-      const existing = pendingVoiceProgressStartRef.current.get(key);
-      if (existing) {
-        window.clearTimeout(existing.timeoutId);
-        existing.resolve(null);
-      }
-
-      const timeoutId = window.setTimeout(() => {
-        pendingVoiceProgressStartRef.current.delete(key);
-        resolve(null);
-      }, timeoutMs);
-
-      pendingVoiceProgressStartRef.current.set(key, { resolve, timeoutId });
-    });
-  }, []);
-
   const progressEventShowsMovement = useCallback((payload) => {
     const command = String(payload?.command || '').trim().toLowerCase();
     const ratio = Number(payload?.progress_ratio);
@@ -692,6 +674,7 @@ function App() {
     clearPendingVoiceToolCalls('Voice session ended before command completion.');
     clearPendingVoiceProgressStartWaiters();
     handledVoiceToolCallIdsRef.current.clear();
+    activeRealtimeToolCallRef.current = null;
 
     const dataChannel = openAiDcRef.current;
     openAiDcRef.current = null;
@@ -760,67 +743,156 @@ function App() {
     }, { urgent: true });
   }, [sendControlPayload]);
 
-  const sendVoiceAssistantUpdate = useCallback((statusText) => {
-    const channel = openAiDcRef.current;
-    const text = String(statusText || '').trim();
-    if (!text || !channel || channel.readyState !== 'open') {
-      return false;
+  const runRobotMotionAction = useCallback(async (options) => {
+    const normalizedCallId = String(options?.callId || '').trim();
+    const normalizedCommand = String(options?.command || '').trim().toLowerCase();
+    const summary = String(options?.summary || normalizedCommand || 'robot action');
+    const timeoutMs = Number(options?.timeoutMs) > 0 ? Number(options.timeoutMs) : 45000;
+
+    if (!normalizedCallId) {
+      return {
+        type: 'voice_command_result',
+        status: 'failed',
+        reason: 'Missing command correlation id.',
+      };
     }
 
-    channel.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: {
-        type: 'message',
-        role: 'user',
-        content: [
-          {
-            type: 'input_text',
-            text: `Robot status update: ${text} Reply in one short sentence and do not call tools for this update.`,
-          },
-        ],
-      },
-    }));
-    channel.send(JSON.stringify({
-      type: 'response.create',
-      response: {
-        modalities: ['audio', 'text'],
-        instructions: 'Acknowledge the robot status update in one short sentence. Do not call tools.',
-      },
-    }));
-    return true;
-  }, []);
+    if (normalizedCommand !== 'move' && normalizedCommand !== 'rotate') {
+      return {
+        type: 'voice_command_result',
+        call_id: normalizedCallId,
+        command: normalizedCommand || 'unknown',
+        status: 'failed',
+        reason: 'Unsupported robot action.',
+      };
+    }
 
-  const monitorVoiceCommandOutcome = useCallback((intentText, resultPromise) => {
-    Promise.resolve(resultPromise)
+    const resultPromise = waitForVoiceToolResult(normalizedCallId, {
+      summary,
+      timeoutMs,
+    });
+
+    const sent = sendVoiceRobotCommand({
+      voice_cmd: normalizedCommand,
+      direction: options?.direction,
+      amount: Number(options?.amount) || 0.0,
+      call_id: normalizedCallId,
+    });
+
+    if (!sent) {
+      resolvePendingVoiceProgressStart(normalizedCallId, null);
+      const failedResult = {
+        type: 'voice_command_result',
+        call_id: normalizedCallId,
+        command: normalizedCommand,
+        status: 'failed',
+        reason: 'Robot transport is not connected.',
+      };
+      resolvePendingVoiceToolCall(normalizedCallId, failedResult);
+      return failedResult;
+    }
+
+    return resultPromise;
+  }, [resolvePendingVoiceProgressStart, resolvePendingVoiceToolCall, sendVoiceRobotCommand, waitForVoiceToolResult]);
+
+  const endActiveAction = useCallback(() => {
+    const activeCallId = String(pendingVoiceCommandRef.current?.callId || '').trim();
+    const stopPayload = {
+      voice_cmd: 'stop',
+      direction: 'none',
+      amount: 0.0,
+    };
+    if (activeCallId) {
+      stopPayload.call_id = activeCallId;
+    }
+
+    const sent = sendVoiceRobotCommand(stopPayload);
+
+    if (sent) {
+      if (activeCallId) {
+        addLog(`Stop requested for command [${activeCallId}].`, 'info');
+      } else {
+        addLog('Stop requested (no active command id was tracked).', 'info');
+      }
+      setStatusMessage('Stop requested for active action...');
+      return;
+    }
+
+    if (activeCallId) {
+      resolvePendingVoiceProgressStart(activeCallId, null);
+      resolvePendingVoiceToolCall(activeCallId, {
+        type: 'voice_command_result',
+        call_id: activeCallId,
+        command: 'unknown',
+        status: 'failed',
+        reason: 'Robot transport is not connected.',
+      });
+    }
+
+    addLog('Failed to send stop command: robot transport is not connected.', 'error');
+    setStatusMessage('Unable to stop action: robot transport is not connected.');
+  }, [addLog, resolvePendingVoiceProgressStart, resolvePendingVoiceToolCall, sendVoiceRobotCommand]);
+
+  const triggerManualAction = useCallback((action) => {
+    const activeCallId = String(pendingVoiceCommandRef.current?.callId || '').trim();
+    if (activeCallId) {
+      setStatusMessage('Another action is already running. Wait for it to finish or tap End Action.');
+      return;
+    }
+
+    let command = '';
+    let direction = '';
+    let amount = 0.0;
+    let timeoutMs = 45000;
+    let summary = '';
+
+    if (action === 'forward' || action === 'backward') {
+      const distanceMeters = clamp(Math.abs(Number(manualMoveMeters) || 0), 0.05, 10.0);
+      command = 'move';
+      direction = action;
+      amount = distanceMeters;
+      timeoutMs = Math.max(45000, 20000 + (distanceMeters * 15000));
+      summary = `manual move ${direction} ${distanceMeters.toFixed(2)} m`;
+    } else if (action === 'left' || action === 'right') {
+      const degrees = clamp(Math.abs(Number(manualTurnDegrees) || 0), 1.0, 720.0);
+      command = 'rotate';
+      direction = action;
+      amount = (degrees * Math.PI) / 180.0;
+      timeoutMs = Math.max(45000, 20000 + (degrees * 250));
+      summary = `manual rotate ${direction} ${degrees.toFixed(0)} deg`;
+    } else {
+      return;
+    }
+
+    const callId = `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    addLog(`Manual action [${callId}] started: ${summary}`, 'info');
+
+    void runRobotMotionAction({
+      command,
+      direction,
+      amount,
+      callId,
+      summary,
+      timeoutMs,
+    })
       .then((result) => {
         const status = String(result?.status || 'failed').toLowerCase();
         const reason = String(result?.reason || '').trim();
 
         if (status === 'completed') {
-          sendVoiceAssistantUpdate(`The robot completed the command to ${intentText}.`);
-          return;
-        }
-
-        const stuckForSec = Number(result?.stuck_for_s) || 0;
-        const reasonLower = reason.toLowerCase();
-        const looksStuck = (
-          stuckForSec >= 2.0
-          || reasonLower.includes('stuck')
-          || reasonLower.includes('blocked')
-          || reasonLower.includes('stopped making progress')
-        );
-
-        if (looksStuck) {
-          sendVoiceAssistantUpdate(`That did not work. The robot got stuck for more than 2 seconds while trying to ${intentText}.`);
+          addLog(`Manual action [${callId}] completed.`, 'success');
+          setStatusMessage(`Manual action completed: ${summary}.`);
         } else {
-          const suffix = reason ? ` Reason: ${reason}` : '';
-          sendVoiceAssistantUpdate(`That did not work while trying to ${intentText}.${suffix}`);
+          addLog(`Manual action [${callId}] failed: ${reason || 'unknown reason'}`, 'error');
+          setStatusMessage(`Manual action failed: ${reason || 'Robot command failed.'}`);
         }
       })
       .catch((err) => {
-        addLog(`Failed to monitor command outcome: ${err?.message || String(err)}`, 'error');
+        const errText = err?.message || String(err);
+        addLog(`Manual action [${callId}] error: ${errText}`, 'error');
+        setStatusMessage(`Manual action error: ${errText}`);
       });
-  }, [addLog, sendVoiceAssistantUpdate]);
+  }, [addLog, manualMoveMeters, manualTurnDegrees, runRobotMotionAction]);
 
   const fetchCapabilities = useCallback(async () => {
     if (backendConfig.usingInsecureBackendFromHttpsPage) {
@@ -1194,7 +1266,7 @@ function App() {
           model: OPENAI_REALTIME_MODEL,
           voice: 'verse',
           modalities: ['audio', 'text'],
-          instructions: 'Control the robot only with tools. Use move(direction, distance) for forward/backward meters. Use rotate(direction, degrees) for left/right turns in degrees. Use respawn() if the robot gets stuck or falls over.',
+          instructions: 'Control the robot only with tools. Use move(direction, distance) for forward/backward meters. Use rotate(direction, degrees) for left/right turns in degrees. Use respawn() if the robot gets stuck or falls over. Never issue a new tool call until the previous tool call has returned.',
         }),
       });
 
@@ -1248,6 +1320,9 @@ function App() {
           args = {};
         }
 
+        const normalizedToolName = String(toolName || '').trim().toLowerCase();
+        const busyReason = 'Robot is still executing another action. Wait for completion or end the current action first.';
+
         const submitToolOutput = (output) => {
           const channel = openAiDcRef.current;
           if (!channel || channel.readyState !== 'open') {
@@ -1265,134 +1340,92 @@ function App() {
           channel.send(JSON.stringify({ type: 'response.create' }));
         };
 
+        const activeActionCallId = String(pendingVoiceCommandRef.current?.callId || '').trim();
+        const activeRealtimeCallId = String(activeRealtimeToolCallRef.current || '').trim();
+
+        if (
+          (activeActionCallId && activeActionCallId !== normalizedCallId)
+          || (activeRealtimeCallId && activeRealtimeCallId !== normalizedCallId)
+        ) {
+          submitToolOutput({
+            success: false,
+            status: 'failed',
+            reason: busyReason,
+            error: busyReason,
+          });
+          return;
+        }
+
+        activeRealtimeToolCallRef.current = normalizedCallId;
+
         (async () => {
           let output;
 
           try {
-            if (toolName === 'move') {
+            if (normalizedToolName === 'move') {
               const directionRaw = String(args.direction || '').trim().toLowerCase();
               const direction = directionRaw === 'backward' || directionRaw === 'back' || directionRaw === 'reverse' || directionRaw === 'bwd'
                 ? 'backward'
                 : 'forward';
               const distanceMeters = clamp(Math.abs(Number(args.distance) || 0), 0.05, 10.0);
-              const intentText = `move ${direction} ${distanceMeters.toFixed(2)} meters`;
               const waitTimeoutMs = Math.max(45000, 20000 + (distanceMeters * 15000));
-              const resultPromise = waitForVoiceToolResult(normalizedCallId, {
+              const backendResult = await runRobotMotionAction({
+                command: 'move',
+                direction,
+                amount: distanceMeters,
+                callId: normalizedCallId,
                 summary: `move ${direction} ${distanceMeters.toFixed(2)} m`,
                 timeoutMs: waitTimeoutMs,
               });
-              const progressStartPromise = waitForVoiceProgressStart(normalizedCallId, { timeoutMs: 1000 });
-              const sent = sendVoiceRobotCommand({
-                voice_cmd: 'move',
+              const backendStatus = String(backendResult?.status || 'failed').toLowerCase();
+              const completed = backendStatus === 'completed';
+              const reason = String(backendResult?.reason || '').trim();
+
+              output = {
+                success: completed,
+                command: 'move',
                 direction,
-                amount: distanceMeters,
-                call_id: normalizedCallId,
-              });
-
-              if (!sent) {
-                resolvePendingVoiceProgressStart(normalizedCallId, null);
-                resolvePendingVoiceToolCall(normalizedCallId, {
-                  type: 'voice_command_result',
-                  call_id: normalizedCallId,
-                  command: 'move',
-                  status: 'failed',
-                  reason: 'Robot transport is not connected.',
-                });
-                output = {
-                  success: false,
-                  command: 'move',
-                  direction,
-                  distance_m: distanceMeters,
-                  status: 'failed',
-                  reason: 'Robot transport is not connected.',
-                };
-              } else {
-                const firstProgress = await progressStartPromise;
-                monitorVoiceCommandOutcome(intentText, resultPromise);
-
-                if (firstProgress) {
-                  output = {
-                    success: true,
-                    command: 'move',
-                    direction,
-                    distance_m: distanceMeters,
-                    status: 'started',
-                    message: `Robot is moving ${direction} ${distanceMeters.toFixed(2)} meters.`,
-                  };
-                } else {
-                  output = {
-                    success: false,
-                    command: 'move',
-                    direction,
-                    distance_m: distanceMeters,
-                    status: 'failed',
-                    reason: 'Robot did not start making progress within 1 second.',
-                  };
-                }
+                distance_m: distanceMeters,
+                status: completed ? 'completed' : 'failed',
+                backend_status: backendStatus,
+                result: backendResult,
+              };
+              if (!completed) {
+                output.reason = reason || 'Robot command failed.';
               }
-            } else if (toolName === 'rotate') {
+            } else if (normalizedToolName === 'rotate') {
               const directionRaw = String(args.direction || '').trim().toLowerCase();
               const direction = directionRaw === 'right' || directionRaw === 'r' || directionRaw === 'cw' || directionRaw === 'clockwise'
                 ? 'right'
                 : 'left';
               const degrees = clamp(Math.abs(Number(args.degrees) || 0), 1.0, 720.0);
               const radians = (degrees * Math.PI) / 180.0;
-              const intentText = `rotate ${degrees.toFixed(0)} degrees to the ${direction}`;
               const waitTimeoutMs = Math.max(45000, 20000 + (degrees * 250));
-              const resultPromise = waitForVoiceToolResult(normalizedCallId, {
+              const backendResult = await runRobotMotionAction({
+                command: 'rotate',
+                direction,
+                amount: radians,
+                callId: normalizedCallId,
                 summary: `rotate ${direction} ${degrees.toFixed(0)} deg`,
                 timeoutMs: waitTimeoutMs,
               });
-              const progressStartPromise = waitForVoiceProgressStart(normalizedCallId, { timeoutMs: 1000 });
-              const sent = sendVoiceRobotCommand({
-                voice_cmd: 'rotate',
+              const backendStatus = String(backendResult?.status || 'failed').toLowerCase();
+              const completed = backendStatus === 'completed';
+              const reason = String(backendResult?.reason || '').trim();
+
+              output = {
+                success: completed,
+                command: 'rotate',
                 direction,
-                amount: radians,
-                call_id: normalizedCallId,
-              });
-
-              if (!sent) {
-                resolvePendingVoiceProgressStart(normalizedCallId, null);
-                resolvePendingVoiceToolCall(normalizedCallId, {
-                  type: 'voice_command_result',
-                  call_id: normalizedCallId,
-                  command: 'rotate',
-                  status: 'failed',
-                  reason: 'Robot transport is not connected.',
-                });
-                output = {
-                  success: false,
-                  command: 'rotate',
-                  direction,
-                  degrees,
-                  status: 'failed',
-                  reason: 'Robot transport is not connected.',
-                };
-              } else {
-                const firstProgress = await progressStartPromise;
-                monitorVoiceCommandOutcome(intentText, resultPromise);
-
-                if (firstProgress) {
-                  output = {
-                    success: true,
-                    command: 'rotate',
-                    direction,
-                    degrees,
-                    status: 'started',
-                    message: `Robot is rotating ${degrees.toFixed(0)} degrees to the ${direction}.`,
-                  };
-                } else {
-                  output = {
-                    success: false,
-                    command: 'rotate',
-                    direction,
-                    degrees,
-                    status: 'failed',
-                    reason: 'Robot did not start making progress within 1 second.',
-                  };
-                }
+                degrees,
+                status: completed ? 'completed' : 'failed',
+                backend_status: backendStatus,
+                result: backendResult,
+              };
+              if (!completed) {
+                output.reason = reason || 'Robot command failed.';
               }
-            } else if (toolName === 'respawn') {
+            } else if (normalizedToolName === 'respawn') {
               const sent = sendVoiceRobotCommand({
                 cmd: 'respawn',
                 voice_cmd: 'stop',
@@ -1424,6 +1457,10 @@ function App() {
               status: 'failed',
               error: err?.message || String(err),
             };
+          } finally {
+            if (activeRealtimeToolCallRef.current === normalizedCallId) {
+              activeRealtimeToolCallRef.current = null;
+            }
           }
 
           submitToolOutput(output);
@@ -1445,7 +1482,7 @@ function App() {
         dc.send(JSON.stringify({
           type: 'session.update',
           session: {
-            instructions: 'You control a robot. Use move for forward/backward distance in meters, rotate for left/right angle in degrees, and respawn if the robot tips over or is unrecoverable. Tool outputs acknowledge motion start after up to 1 second, and separate status updates may arrive when commands complete or fail.',
+            instructions: 'You control a robot. Use move for forward/backward distance in meters, rotate for left/right angle in degrees, and respawn if the robot tips over or is unrecoverable. Wait for each tool output before calling another tool; never overlap tool calls.',
             tools: [
               {
                 type: 'function',
@@ -1592,6 +1629,8 @@ function App() {
   const pendingVoiceRemainingSec = pendingVoiceCommand
     ? Math.max(0, (pendingVoiceCommand.timeoutMs / 1000) - pendingVoiceElapsedSec)
     : 0;
+
+  const actionInProgress = pendingVoiceCommand !== null;
 
   const pendingVoiceProgressView = useMemo(() => {
     if (!pendingVoiceCommand) {
@@ -1899,6 +1938,139 @@ function App() {
             )}
           </div>
         ) : null}
+
+        <div style={{ marginTop: '0.5rem', borderTop: '1px solid var(--border)', paddingTop: '0.7rem', display: 'grid', gap: '0.7rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+            <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>Action Controls</div>
+            <button
+              onClick={endActiveAction}
+              disabled={!actionInProgress}
+              style={{
+                padding: '0.4rem 0.7rem',
+                border: '1px solid var(--border)',
+                borderRadius: 8,
+                background: actionInProgress ? 'rgba(239, 68, 68, 0.18)' : 'var(--social-bg)',
+                color: 'var(--text-h)',
+                cursor: actionInProgress ? 'pointer' : 'not-allowed',
+                opacity: actionInProgress ? 1 : 0.65,
+              }}
+            >
+              End Action
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', gap: '0.8rem', flexWrap: 'wrap', alignItems: 'center' }}>
+            <label style={{ display: 'grid', gap: '0.25rem', minWidth: 160 }}>
+              <span style={{ fontSize: '0.82rem', color: 'var(--text)' }}>Move step (meters)</span>
+              <input
+                type="number"
+                min="0.05"
+                max="10"
+                step="0.05"
+                value={manualMoveMeters}
+                onChange={(event) => setManualMoveMeters(clamp(Math.abs(Number(event.target.value) || 0), 0.05, 10.0))}
+                style={{
+                  padding: '0.4rem 0.5rem',
+                  border: '1px solid var(--border)',
+                  borderRadius: 8,
+                  background: 'var(--bg)',
+                  color: 'var(--text-h)',
+                }}
+              />
+            </label>
+
+            <label style={{ display: 'grid', gap: '0.25rem', minWidth: 160 }}>
+              <span style={{ fontSize: '0.82rem', color: 'var(--text)' }}>Turn step (degrees)</span>
+              <input
+                type="number"
+                min="1"
+                max="720"
+                step="1"
+                value={manualTurnDegrees}
+                onChange={(event) => setManualTurnDegrees(clamp(Math.abs(Number(event.target.value) || 0), 1.0, 720.0))}
+                style={{
+                  padding: '0.4rem 0.5rem',
+                  border: '1px solid var(--border)',
+                  borderRadius: 8,
+                  background: 'var(--bg)',
+                  color: 'var(--text-h)',
+                }}
+              />
+            </label>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '0.5rem' }}>
+            <button
+              onClick={() => triggerManualAction('forward')}
+              disabled={actionInProgress}
+              style={{
+                padding: '0.55rem 0.75rem',
+                border: '1px solid var(--border)',
+                borderRadius: 8,
+                background: 'var(--social-bg)',
+                color: 'var(--text-h)',
+                cursor: actionInProgress ? 'not-allowed' : 'pointer',
+                opacity: actionInProgress ? 0.65 : 1,
+              }}
+            >
+              Forward
+            </button>
+
+            <button
+              onClick={() => triggerManualAction('backward')}
+              disabled={actionInProgress}
+              style={{
+                padding: '0.55rem 0.75rem',
+                border: '1px solid var(--border)',
+                borderRadius: 8,
+                background: 'var(--social-bg)',
+                color: 'var(--text-h)',
+                cursor: actionInProgress ? 'not-allowed' : 'pointer',
+                opacity: actionInProgress ? 0.65 : 1,
+              }}
+            >
+              Backward
+            </button>
+
+            <button
+              onClick={() => triggerManualAction('left')}
+              disabled={actionInProgress}
+              style={{
+                padding: '0.55rem 0.75rem',
+                border: '1px solid var(--border)',
+                borderRadius: 8,
+                background: 'var(--social-bg)',
+                color: 'var(--text-h)',
+                cursor: actionInProgress ? 'not-allowed' : 'pointer',
+                opacity: actionInProgress ? 0.65 : 1,
+              }}
+            >
+              Turn Left
+            </button>
+
+            <button
+              onClick={() => triggerManualAction('right')}
+              disabled={actionInProgress}
+              style={{
+                padding: '0.55rem 0.75rem',
+                border: '1px solid var(--border)',
+                borderRadius: 8,
+                background: 'var(--social-bg)',
+                color: 'var(--text-h)',
+                cursor: actionInProgress ? 'not-allowed' : 'pointer',
+                opacity: actionInProgress ? 0.65 : 1,
+              }}
+            >
+              Turn Right
+            </button>
+          </div>
+
+          <div style={{ fontSize: '0.82rem', color: 'var(--text)' }}>
+            {actionInProgress
+              ? 'Action in progress. Wait for completion or tap End Action before triggering another movement.'
+              : 'Manual buttons trigger discrete move/turn actions using the step values above.'}
+          </div>
+        </div>
         
         <div style={{ marginTop: '0.5rem', borderTop: '1px solid var(--border)', paddingTop: '0.7rem' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
