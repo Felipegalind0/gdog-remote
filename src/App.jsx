@@ -1419,9 +1419,7 @@ function App() {
               />
             </div>
           </>
-        ) : (
-   
-        )}
+        ) : null}
         {/* Voice key panel is minimized by default. Use the call button above and show the key field only when needed. */}
 
         <div style={{ fontSize: '0.84rem', color: 'var(--text)' }}>
