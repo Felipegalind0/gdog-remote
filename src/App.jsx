@@ -190,6 +190,7 @@ function normalizeBackendTarget(rawValue) {
     commandUrl: `${httpBase}/command`,
     offerUrl: `${httpBase}/offer`,
     capabilitiesUrl: `${httpBase}/capabilities`,
+    eventsUrl: `${httpBase}/events`,
     usingInsecureBackendFromHttpsPage: pageIsHttps && httpProtocol === 'http:',
   };
 }
@@ -334,6 +335,9 @@ function App() {
   const httpFallbackInFlightRef = useRef(false);
   const lastHttpFallbackSendMsRef = useRef(0);
   const lastHttpFallbackErrorLogMsRef = useRef(0);
+  const eventsSinceIdRef = useRef(0);
+  const httpEventPollInFlightRef = useRef(false);
+  const lastHttpEventPollErrorLogMsRef = useRef(0);
   const openAiPcRef = useRef(null);
   const openAiDcRef = useRef(null);
   const openAiMicStreamRef = useRef(null);
@@ -489,6 +493,61 @@ function App() {
     return sendHttpControlFallback(payloadObject, options);
   }, [httpFallbackActive, sendHttpControlFallback, webrtcConnected]);
 
+  const sendHttpCommandWithAck = useCallback(async (payloadObject, options = {}) => {
+    if (backendConfig.usingInsecureBackendFromHttpsPage) {
+      return {
+        ok: false,
+        reason: 'Browser blocked HTTP backend from HTTPS page.',
+      };
+    }
+
+    const attemptsRaw = Number(options.attempts);
+    const attempts = Number.isFinite(attemptsRaw) ? clamp(Math.round(attemptsRaw), 1, 4) : 2;
+    const retryDelayMs = Number(options.retryDelayMs) > 0 ? Number(options.retryDelayMs) : 120;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        const res = await fetch(backendConfig.commandUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadObject),
+          keepalive: false,
+        });
+
+        if (!res.ok) {
+          throw new Error(`status ${res.status}`);
+        }
+
+        if (!unmountedRef.current) {
+          setHttpFallbackActive((previous) => {
+            if (!previous) {
+              addLog(`HTTP fallback active: sending commands to ${backendConfig.commandUrl}`, 'info');
+            }
+            return true;
+          });
+        }
+
+        return { ok: true };
+      } catch (err) {
+        lastError = err;
+        if (attempt < attempts) {
+          await new Promise((resolve) => {
+            window.setTimeout(resolve, retryDelayMs);
+          });
+        }
+      }
+    }
+
+    const reason = lastError?.message || String(lastError || 'HTTP command send failed');
+    if (!unmountedRef.current) {
+      addLog(`HTTP command send failed after ${attempts} attempt(s): ${reason}`, 'error');
+      setHttpFallbackActive(false);
+    }
+
+    return { ok: false, reason };
+  }, [addLog, backendConfig.commandUrl, backendConfig.usingInsecureBackendFromHttpsPage]);
+
   const resolvePendingVoiceToolCall = useCallback((callId, resultPayload) => {
     const key = String(callId || '').trim();
     if (!key) return false;
@@ -634,6 +693,11 @@ function App() {
       return;
     }
 
+    const eventId = Number(message?._event_id);
+    if (Number.isFinite(eventId)) {
+      eventsSinceIdRef.current = Math.max(eventsSinceIdRef.current, eventId);
+    }
+
     if (message?.type === 'voice_command_progress') {
       const callId = String(message.call_id || '').trim();
       if (!callId) {
@@ -669,6 +733,65 @@ function App() {
     resolvePendingVoiceProgressStart(message.call_id, null);
     resolvePendingVoiceToolCall(message.call_id, message);
   }, [resolvePendingVoiceToolCall, addLog, progressEventShowsMovement, resolvePendingVoiceProgressStart]);
+
+  const pollHttpEventsOnce = useCallback(async () => {
+    if (backendConfig.usingInsecureBackendFromHttpsPage) {
+      return;
+    }
+
+    if (webrtcConnected || wsConnected) {
+      return;
+    }
+
+    if (httpEventPollInFlightRef.current) {
+      return;
+    }
+
+    httpEventPollInFlightRef.current = true;
+    try {
+      const since = Math.max(0, Number(eventsSinceIdRef.current) || 0);
+      const url = `${backendConfig.eventsUrl}?since=${encodeURIComponent(String(since))}&limit=250`;
+      const res = await fetch(url, {
+        method: 'GET',
+        cache: 'no-store',
+      });
+
+      if (!res.ok) {
+        throw new Error(`status ${res.status}`);
+      }
+
+      const data = await res.json();
+      const events = Array.isArray(data?.events) ? data.events : [];
+
+      for (const eventPayload of events) {
+        const eventId = Number(eventPayload?._event_id);
+        if (Number.isFinite(eventId)) {
+          eventsSinceIdRef.current = Math.max(eventsSinceIdRef.current, eventId);
+        }
+
+        try {
+          handleRobotStatusMessage(JSON.stringify(eventPayload));
+        } catch {
+          // Ignore malformed event payloads.
+        }
+      }
+
+      const latestId = Number(data?.latest_event_id);
+      if (Number.isFinite(latestId)) {
+        eventsSinceIdRef.current = Math.max(eventsSinceIdRef.current, latestId);
+      }
+    } catch (err) {
+      if (!unmountedRef.current) {
+        const nowMs = Date.now();
+        if (nowMs - lastHttpEventPollErrorLogMsRef.current > 3000) {
+          lastHttpEventPollErrorLogMsRef.current = nowMs;
+          addLog(`HTTP events polling failed: ${err?.message || String(err)}`, 'error');
+        }
+      }
+    } finally {
+      httpEventPollInFlightRef.current = false;
+    }
+  }, [addLog, backendConfig.eventsUrl, backendConfig.usingInsecureBackendFromHttpsPage, handleRobotStatusMessage, webrtcConnected, wsConnected]);
 
   const stopVoiceControl = useCallback((statusOverride = null) => {
     clearPendingVoiceToolCalls('Voice session ended before command completion.');
@@ -772,47 +895,88 @@ function App() {
       timeoutMs,
     });
 
-    const sent = sendVoiceRobotCommand({
+    const commandPayload = {
       voice_cmd: normalizedCommand,
       direction: options?.direction,
       amount: Number(options?.amount) || 0.0,
       call_id: normalizedCallId,
-    });
+    };
 
-    if (!sent) {
-      resolvePendingVoiceProgressStart(normalizedCallId, null);
-      const failedResult = {
-        type: 'voice_command_result',
-        call_id: normalizedCallId,
-        command: normalizedCommand,
-        status: 'failed',
-        reason: 'Robot transport is not connected.',
-      };
-      resolvePendingVoiceToolCall(normalizedCallId, failedResult);
-      return failedResult;
+    if (webrtcConnected || wsConnected) {
+      const sent = sendVoiceRobotCommand(commandPayload);
+      if (!sent) {
+        resolvePendingVoiceProgressStart(normalizedCallId, null);
+        const failedResult = {
+          type: 'voice_command_result',
+          call_id: normalizedCallId,
+          command: normalizedCommand,
+          status: 'failed',
+          reason: 'Robot transport is not connected.',
+        };
+        resolvePendingVoiceToolCall(normalizedCallId, failedResult);
+        return failedResult;
+      }
+    } else {
+      const ack = await sendHttpCommandWithAck({
+        vx: 0.0,
+        omega: 0.0,
+        pitch_cmd: pitchCmdRef.current,
+        roll_cmd: rollCmdRef.current,
+        ...commandPayload,
+      }, {
+        attempts: 3,
+        retryDelayMs: 140,
+      });
+
+      if (!ack.ok) {
+        resolvePendingVoiceProgressStart(normalizedCallId, null);
+        const failedResult = {
+          type: 'voice_command_result',
+          call_id: normalizedCallId,
+          command: normalizedCommand,
+          status: 'failed',
+          reason: ack.reason || 'Robot transport is not connected.',
+        };
+        resolvePendingVoiceToolCall(normalizedCallId, failedResult);
+        return failedResult;
+      }
     }
 
     return resultPromise;
-  }, [resolvePendingVoiceProgressStart, resolvePendingVoiceToolCall, sendVoiceRobotCommand, waitForVoiceToolResult]);
+  }, [resolvePendingVoiceProgressStart, resolvePendingVoiceToolCall, sendHttpCommandWithAck, sendVoiceRobotCommand, waitForVoiceToolResult, webrtcConnected, wsConnected]);
 
-  const endActiveAction = useCallback(() => {
+  const endActiveAction = useCallback(async () => {
     const activeCallId = String(pendingVoiceCommandRef.current?.callId || '').trim();
+    const stopCallId = activeCallId || `manual-stop-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const stopPayload = {
       voice_cmd: 'stop',
       direction: 'none',
       amount: 0.0,
+      call_id: stopCallId,
     };
-    if (activeCallId) {
-      stopPayload.call_id = activeCallId;
-    }
 
-    const sent = sendVoiceRobotCommand(stopPayload);
+    let sent = false;
+    if (webrtcConnected || wsConnected) {
+      sent = sendVoiceRobotCommand(stopPayload);
+    } else {
+      const ack = await sendHttpCommandWithAck({
+        vx: 0.0,
+        omega: 0.0,
+        pitch_cmd: pitchCmdRef.current,
+        roll_cmd: rollCmdRef.current,
+        ...stopPayload,
+      }, {
+        attempts: 3,
+        retryDelayMs: 130,
+      });
+      sent = Boolean(ack.ok);
+    }
 
     if (sent) {
       if (activeCallId) {
         addLog(`Stop requested for command [${activeCallId}].`, 'info');
       } else {
-        addLog('Stop requested (no active command id was tracked).', 'info');
+        addLog(`Stop requested (no active command id was tracked). Using stop call id [${stopCallId}].`, 'info');
       }
       setStatusMessage('Stop requested for active action...');
       return;
@@ -831,7 +995,7 @@ function App() {
 
     addLog('Failed to send stop command: robot transport is not connected.', 'error');
     setStatusMessage('Unable to stop action: robot transport is not connected.');
-  }, [addLog, resolvePendingVoiceProgressStart, resolvePendingVoiceToolCall, sendVoiceRobotCommand]);
+  }, [addLog, resolvePendingVoiceProgressStart, resolvePendingVoiceToolCall, sendHttpCommandWithAck, sendVoiceRobotCommand, webrtcConnected, wsConnected]);
 
   const triggerManualAction = useCallback((action) => {
     const activeCallId = String(pendingVoiceCommandRef.current?.callId || '').trim();
@@ -851,7 +1015,7 @@ function App() {
       command = 'move';
       direction = action;
       amount = distanceMeters;
-      timeoutMs = Math.max(45000, 20000 + (distanceMeters * 15000));
+      timeoutMs = Math.max(250, Math.round(distanceMeters * 4000));
       summary = `manual move ${direction} ${distanceMeters.toFixed(2)} m`;
     } else if (action === 'left' || action === 'right') {
       const degrees = clamp(Math.abs(Number(manualTurnDegrees) || 0), 1.0, 720.0);
@@ -1018,6 +1182,9 @@ function App() {
     httpFallbackInFlightRef.current = false;
     lastHttpFallbackSendMsRef.current = 0;
     lastHttpFallbackErrorLogMsRef.current = 0;
+    eventsSinceIdRef.current = 0;
+    httpEventPollInFlightRef.current = false;
+    lastHttpEventPollErrorLogMsRef.current = 0;
     if (targetChanged) {
       setBackendTarget(normalized.input);
       setStatusMessage(`Switching backend to ${normalized.httpBase} ...`);
@@ -1133,6 +1300,9 @@ function App() {
     httpFallbackInFlightRef.current = false;
     lastHttpFallbackSendMsRef.current = 0;
     lastHttpFallbackErrorLogMsRef.current = 0;
+    eventsSinceIdRef.current = 0;
+    httpEventPollInFlightRef.current = false;
+    lastHttpEventPollErrorLogMsRef.current = 0;
     disconnectWebRTC();
     disconnectWebSocket();
     fetchCapabilities();
@@ -1205,6 +1375,31 @@ function App() {
 
     return () => clearTimeout(timer);
   }, [webrtcConnected, wsConnected, connectWebSocket]);
+
+  useEffect(() => {
+    if (backendConfig.usingInsecureBackendFromHttpsPage) {
+      return undefined;
+    }
+
+    if (webrtcConnected || wsConnected) {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const pollLoop = async () => {
+      if (cancelled || unmountedRef.current) return;
+      await pollHttpEventsOnce();
+      if (cancelled || unmountedRef.current) return;
+      window.setTimeout(pollLoop, 140);
+    };
+
+    void pollLoop();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [backendConfig.usingInsecureBackendFromHttpsPage, pollHttpEventsOnce, webrtcConnected, wsConnected]);
 
   // 50Hz Control Loop over preferred channel
   useEffect(() => {
@@ -1368,7 +1563,7 @@ function App() {
                 ? 'backward'
                 : 'forward';
               const distanceMeters = clamp(Math.abs(Number(args.distance) || 0), 0.05, 10.0);
-              const waitTimeoutMs = Math.max(45000, 20000 + (distanceMeters * 15000));
+              const waitTimeoutMs = Math.max(250, Math.round(distanceMeters * 4000));
               const backendResult = await runRobotMotionAction({
                 command: 'move',
                 direction,
@@ -1426,13 +1621,29 @@ function App() {
                 output.reason = reason || 'Robot command failed.';
               }
             } else if (normalizedToolName === 'respawn') {
-              const sent = sendVoiceRobotCommand({
+              let sent = false;
+              const respawnPayload = {
                 cmd: 'respawn',
                 voice_cmd: 'stop',
                 direction: 'none',
                 amount: 0.0,
                 call_id: normalizedCallId,
-              });
+              };
+              if (webrtcConnected || wsConnected) {
+                sent = sendVoiceRobotCommand(respawnPayload);
+              } else {
+                const ack = await sendHttpCommandWithAck({
+                  vx: 0.0,
+                  omega: 0.0,
+                  pitch_cmd: pitchCmdRef.current,
+                  roll_cmd: rollCmdRef.current,
+                  ...respawnPayload,
+                }, {
+                  attempts: 3,
+                  retryDelayMs: 130,
+                });
+                sent = Boolean(ack.ok);
+              }
               if (sent) {
                 addLog(`Command [${normalizedCallId}] respawn: robot reset to spawn pose`, 'info');
               } else {
