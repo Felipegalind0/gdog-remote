@@ -311,6 +311,8 @@ function App() {
   const [voiceSessionActive, setVoiceSessionActive] = useState(false);
   const [voiceSessionConnecting, setVoiceSessionConnecting] = useState(false);
   const [voicePanelExpanded, setVoicePanelExpanded] = useState(false);
+  const [pendingVoiceCommand, setPendingVoiceCommand] = useState(null);
+  const [pendingVoiceElapsedSec, setPendingVoiceElapsedSec] = useState(0);
   const [statusMessage, setStatusMessage] = useState('Booting remote controller...');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [viewport, setViewport] = useState(() => ({ width: window.innerWidth, height: window.innerHeight }));
@@ -398,6 +400,7 @@ function App() {
 
     window.clearTimeout(pending.timeoutId);
     pendingVoiceToolCallsRef.current.delete(key);
+    setPendingVoiceCommand((current) => (current && current.callId === key ? null : current));
     pending.resolve(resultPayload);
     return true;
   }, []);
@@ -414,10 +417,13 @@ function App() {
       pending.resolve(fallbackResult);
     }
     pendingVoiceToolCallsRef.current.clear();
+    setPendingVoiceCommand(null);
   }, []);
 
-  const waitForVoiceToolResult = useCallback((callId, timeoutMs = 45000) => {
+  const waitForVoiceToolResult = useCallback((callId, options = {}) => {
     const key = String(callId || '').trim();
+    const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 45000;
+    const summary = String(options.summary || 'robot command');
     if (!key) {
       return Promise.resolve({
         type: 'voice_command_result',
@@ -427,8 +433,16 @@ function App() {
     }
 
     return new Promise((resolve) => {
+      setPendingVoiceCommand({
+        callId: key,
+        summary,
+        timeoutMs,
+        startedAtMs: Date.now(),
+      });
+
       const timeoutId = window.setTimeout(() => {
         pendingVoiceToolCallsRef.current.delete(key);
+        setPendingVoiceCommand((current) => (current && current.callId === key ? null : current));
         resolve({
           type: 'voice_command_result',
           call_id: key,
@@ -440,6 +454,24 @@ function App() {
       pendingVoiceToolCallsRef.current.set(key, { resolve, timeoutId });
     });
   }, []);
+
+  useEffect(() => {
+    if (!pendingVoiceCommand) {
+      setPendingVoiceElapsedSec(0);
+      return undefined;
+    }
+
+    const tick = () => {
+      const elapsedSec = (Date.now() - pendingVoiceCommand.startedAtMs) / 1000;
+      setPendingVoiceElapsedSec(Math.max(0, elapsedSec));
+    };
+
+    tick();
+    const timer = window.setInterval(tick, 100);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [pendingVoiceCommand]);
 
   const handleRobotStatusMessage = useCallback((rawPayload) => {
     if (typeof rawPayload !== 'string') {
@@ -943,7 +975,11 @@ function App() {
                 ? 'backward'
                 : 'forward';
               const distanceMeters = clamp(Math.abs(Number(args.distance) || 0), 0.05, 10.0);
-              const resultPromise = waitForVoiceToolResult(normalizedCallId);
+              const waitTimeoutMs = Math.max(45000, 20000 + (distanceMeters * 15000));
+              const resultPromise = waitForVoiceToolResult(normalizedCallId, {
+                summary: `move ${direction} ${distanceMeters.toFixed(2)} m`,
+                timeoutMs: waitTimeoutMs,
+              });
               const sent = sendVoiceRobotCommand({
                 voice_cmd: 'move',
                 direction,
@@ -979,7 +1015,11 @@ function App() {
                 : 'left';
               const degrees = clamp(Math.abs(Number(args.degrees) || 0), 1.0, 720.0);
               const radians = (degrees * Math.PI) / 180.0;
-              const resultPromise = waitForVoiceToolResult(normalizedCallId);
+              const waitTimeoutMs = Math.max(45000, 20000 + (degrees * 250));
+              const resultPromise = waitForVoiceToolResult(normalizedCallId, {
+                summary: `rotate ${direction} ${degrees.toFixed(0)} deg`,
+                timeoutMs: waitTimeoutMs,
+              });
               const sent = sendVoiceRobotCommand({
                 voice_cmd: 'rotate',
                 direction,
@@ -1389,6 +1429,12 @@ function App() {
           Realtime session: {voiceSessionConnecting ? 'connecting...' : voiceSessionActive ? 'active' : 'idle'}
           {callButtonBusy ? ' ⏳' : voiceSessionActive ? ' ✅' : ' ⭕'}
         </div>
+
+        {pendingVoiceCommand ? (
+          <div style={{ fontSize: '0.84rem', color: 'var(--text)' }}>
+            Waiting on robot: {pendingVoiceCommand.summary} · {pendingVoiceElapsedSec.toFixed(1)}s / {(pendingVoiceCommand.timeoutMs / 1000).toFixed(0)}s ⏱️
+          </div>
+        ) : null}
       </div>
       
       <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem', marginBottom: '2rem' }}>
