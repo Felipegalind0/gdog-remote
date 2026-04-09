@@ -12,6 +12,7 @@ The app sends drive and posture commands at 50 Hz to the simulator backend and w
   - Right stick: pitch/roll normalized commands (`pitch_cmd`, `roll_cmd`)
 - Sensitivity sliders for velocity and yaw
 - WebSocket default transport with optional WebRTC data channel
+- Automatic HTTP command fallback when WebSocket upgrades are blocked
 - Backend target UI where you can type IP/host (for example `192.168.1.25:8000`)
 - URL parameter override via `?backend=...`
 - Backend target persistence in local storage
@@ -126,12 +127,16 @@ Example:
   - verify phone and Mac are on same network
   - verify backend target is correct (`<mac-ip>:8000`)
   - verify backend is running in gdog-sim
+- Phone opens remote and backend HTTPS probe works, but WebSocket never connects on guest Wi-Fi:
+  - that network is likely blocking WebSocket upgrade frames
+  - use Cloudflare quick tunnel with `--quick-tunnel-protocol http2 --quick-tunnel-edge-ip-version 4`
+  - remote should show `Transport: HTTP fallback (restricted network mode)` if fallback is active
 - GitHub Pages loads but controls do nothing:
   - likely mixed content (HTTPS page trying HTTP backend)
   - use HTTPS/WSS backend URL (tunnel or reverse proxy)
 - WebRTC button stays disabled:
-  - backend `/capabilities` is currently missing in gdog-sim
-  - WebSocket mode is still expected to work
+  - backend reports WebRTC unavailable (aiortc not installed)
+  - WebSocket or HTTP fallback mode is still expected to work
 - White page or stale UI:
   - run `npm install`
   - hard refresh browser cache

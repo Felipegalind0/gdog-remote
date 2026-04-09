@@ -185,6 +185,7 @@ function normalizeBackendTarget(rawValue) {
     input: normalizedInput,
     httpBase,
     wsUrl: `${wsProtocol}//${hostPort}/ws`,
+    commandUrl: `${httpBase}/command`,
     offerUrl: `${httpBase}/offer`,
     capabilitiesUrl: `${httpBase}/capabilities`,
     usingInsecureBackendFromHttpsPage: pageIsHttps && httpProtocol === 'http:',
@@ -306,6 +307,7 @@ function App() {
   const [capabilities, setCapabilities] = useState({ loaded: false, webrtc: false });
   const [webrtcConnected, setWebrtcConnected] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
+  const [httpFallbackActive, setHttpFallbackActive] = useState(false);
   const [velocitySensitivity, setVelocitySensitivity] = useState(1.0);
   const [yawSensitivity, setYawSensitivity] = useState(1.0);
   const [voiceSessionActive, setVoiceSessionActive] = useState(false);
@@ -317,11 +319,17 @@ function App() {
   const [statusMessage, setStatusMessage] = useState('Booting remote controller...');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [viewport, setViewport] = useState(() => ({ width: window.innerWidth, height: window.innerHeight }));
+  const [logs, setLogs] = useState([]);
+  const [logsExpanded, setLogsExpanded] = useState(false);
   
   const appRef = useRef(null);
   const pcRef = useRef(null);
   const dcRef = useRef(null);
   const wsRef = useRef(null);
+  const wsEverOpenedRef = useRef(false);
+  const httpFallbackInFlightRef = useRef(false);
+  const lastHttpFallbackSendMsRef = useRef(0);
+  const lastHttpFallbackErrorLogMsRef = useRef(0);
   const openAiPcRef = useRef(null);
   const openAiDcRef = useRef(null);
   const openAiMicStreamRef = useRef(null);
@@ -337,6 +345,21 @@ function App() {
   const rollCmdRef = useRef(0.0);
 
   const backendConfig = useMemo(() => normalizeBackendTarget(backendTarget), [backendTarget]);
+
+  const addLog = useCallback((message, type = 'info') => {
+    const msg = String(message || '').trim();
+    if (!msg) return;
+
+    const now = new Date();
+    const time = now.toLocaleTimeString([], { hour12: false });
+    const id = `${now.getTime()}-${Math.random().toString(36).slice(2, 9)}`;
+
+    setLogs((current) => [...current.slice(-199), { id, time, msg, type }]);
+
+    if (type === 'error') {
+      setLogsExpanded(true);
+    }
+  }, []);
 
   const disconnectWebRTC = useCallback(() => {
     if (dcRef.current) {
@@ -365,16 +388,80 @@ function App() {
     ws.onerror = null;
     ws.onmessage = null;
     ws.close();
+    wsEverOpenedRef.current = false;
 
     setWsConnected(false);
   }, []);
 
-  const sendControlPayload = useCallback((payloadObject) => {
+  const sendHttpControlFallback = useCallback((payloadObject, options = {}) => {
+    if (backendConfig.usingInsecureBackendFromHttpsPage) {
+      return false;
+    }
+
+    const urgent = Boolean(options.urgent);
+    const now = Date.now();
+    if (!urgent && (now - lastHttpFallbackSendMsRef.current) < 110) {
+      return true;
+    }
+    if (!urgent && httpFallbackInFlightRef.current) {
+      return true;
+    }
+
+    lastHttpFallbackSendMsRef.current = now;
+    httpFallbackInFlightRef.current = true;
+
+    fetch(backendConfig.commandUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payloadObject),
+      keepalive: false,
+    })
+      .then((res) => {
+        if (!res.ok) {
+          throw new Error(`status ${res.status}`);
+        }
+        if (unmountedRef.current) return;
+
+        setHttpFallbackActive((previous) => {
+          if (!previous) {
+            addLog(`HTTP fallback active: sending commands to ${backendConfig.commandUrl}`, 'info');
+          }
+          return true;
+        });
+        setStatusMessage((prev) => {
+          if (prev.includes('WebRTC active') || prev.includes('WebSocket connected')) {
+            return prev;
+          }
+          return `HTTP fallback active at ${backendConfig.httpBase}. Network appears to block WebSockets.`;
+        });
+      })
+      .catch((err) => {
+        console.warn('HTTP fallback send failed:', err);
+        if (unmountedRef.current) return;
+        setHttpFallbackActive(false);
+
+        const nowMs = Date.now();
+        if (nowMs - lastHttpFallbackErrorLogMsRef.current > 2500) {
+          lastHttpFallbackErrorLogMsRef.current = nowMs;
+          addLog(`HTTP fallback send failed: ${err?.message || String(err)}`, 'error');
+        }
+      })
+      .finally(() => {
+        httpFallbackInFlightRef.current = false;
+      });
+
+    return true;
+  }, [addLog, backendConfig.commandUrl, backendConfig.httpBase, backendConfig.usingInsecureBackendFromHttpsPage]);
+
+  const sendControlPayload = useCallback((payloadObject, options = {}) => {
     const payload = JSON.stringify(payloadObject);
 
     if (webrtcConnected && dcRef.current && dcRef.current.readyState === 'open') {
       try {
         dcRef.current.send(payload);
+        if (httpFallbackActive) {
+          setHttpFallbackActive(false);
+        }
         return true;
       } catch (err) {
         console.error('Data channel send failed:', err);
@@ -384,14 +471,17 @@ function App() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
         wsRef.current.send(payload);
+        if (httpFallbackActive) {
+          setHttpFallbackActive(false);
+        }
         return true;
       } catch (err) {
         console.error('WebSocket send failed:', err);
       }
     }
 
-    return false;
-  }, [webrtcConnected]);
+    return sendHttpControlFallback(payloadObject, options);
+  }, [httpFallbackActive, sendHttpControlFallback, webrtcConnected]);
 
   const resolvePendingVoiceToolCall = useCallback((callId, resultPayload) => {
     const key = String(callId || '').trim();
@@ -436,6 +526,8 @@ function App() {
       });
     }
 
+    addLog(`Sending command [${key}]: ${summary}`, 'info');
+
     return new Promise((resolve) => {
       setPendingVoiceProgress(null);
       setPendingVoiceCommand({
@@ -449,6 +541,7 @@ function App() {
         pendingVoiceToolCallsRef.current.delete(key);
         setPendingVoiceCommand((current) => (current && current.callId === key ? null : current));
         setPendingVoiceProgress((current) => (current && current.callId === key ? null : current));
+        addLog(`Command [${key}] timed out waiting for robot telemetry.`, 'error');
         resolve({
           type: 'voice_command_result',
           call_id: key,
@@ -459,7 +552,7 @@ function App() {
 
       pendingVoiceToolCallsRef.current.set(key, { resolve, timeoutId });
     });
-  }, []);
+  }, [addLog]);
 
   useEffect(() => {
     pendingVoiceCommandRef.current = pendingVoiceCommand;
@@ -482,6 +575,7 @@ function App() {
       window.clearInterval(timer);
     };
   }, [pendingVoiceCommand]);
+
 
   const handleRobotStatusMessage = useCallback((rawPayload) => {
     if (typeof rawPayload !== 'string') {
@@ -518,8 +612,12 @@ function App() {
       return;
     }
 
+    const status = message.status;
+    const reason = message.reason;
+    addLog(`Command [${message.call_id}] finished: ${status}${reason ? ' - ' + reason : ''}`, status === 'completed' ? 'success' : 'error');
+
     resolvePendingVoiceToolCall(message.call_id, message);
-  }, [resolvePendingVoiceToolCall]);
+  }, [resolvePendingVoiceToolCall, addLog]);
 
   const stopVoiceControl = useCallback((statusOverride = null) => {
     clearPendingVoiceToolCalls('Voice session ended before command completion.');
@@ -589,7 +687,7 @@ function App() {
       pitch_cmd: pitchCmdRef.current,
       roll_cmd: rollCmdRef.current,
       ...voicePayload,
-    });
+    }, { urgent: true });
   }, [sendControlPayload]);
 
   const fetchCapabilities = useCallback(async () => {
@@ -610,16 +708,19 @@ function App() {
       setCapabilities({ loaded: true, webrtc: webrtcAvailable });
 
       if (webrtcAvailable) {
-        setStatusMessage(`Connected to ${backendConfig.httpBase}. WebSocket active, WebRTC available.`);
+        setStatusMessage(`Connected to ${backendConfig.httpBase}. WebRTC available. Attempting WebSocket connection...`);
+        addLog(`Backend reachable at ${backendConfig.httpBase}. WebRTC available.`, 'success');
       } else {
-        setStatusMessage(`Connected to ${backendConfig.httpBase}. WebSocket active, WebRTC unavailable on server.`);
+        setStatusMessage(`Connected to ${backendConfig.httpBase}. WebRTC unavailable on server. Attempting WebSocket connection...`);
+        addLog(`Backend reachable at ${backendConfig.httpBase}. WebRTC unavailable.`, 'info');
       }
     } catch (err) {
       console.warn('Capabilities probe failed:', err);
       setCapabilities({ loaded: true, webrtc: false });
-      setStatusMessage('Capabilities probe failed. Running in WebSocket mode.');
+      setStatusMessage('Capabilities probe failed. Retrying WebSocket and falling back to HTTP commands if upgrades are blocked.');
+      addLog(`Capabilities probe failed at ${backendConfig.capabilitiesUrl}: ${err?.message || String(err)}`, 'error');
     }
-  }, [backendConfig.capabilitiesUrl, backendConfig.httpBase, backendConfig.usingInsecureBackendFromHttpsPage]);
+  }, [addLog, backendConfig.capabilitiesUrl, backendConfig.httpBase, backendConfig.usingInsecureBackendFromHttpsPage]);
 
   const connectWebSocket = useCallback(() => {
     if (backendConfig.usingInsecureBackendFromHttpsPage) {
@@ -635,6 +736,8 @@ function App() {
       return;
     }
 
+    wsEverOpenedRef.current = false;
+
     let ws;
     try {
       ws = new WebSocket(backendConfig.wsUrl);
@@ -648,16 +751,35 @@ function App() {
 
     ws.onopen = () => {
       if (unmountedRef.current) return;
+      wsEverOpenedRef.current = true;
       setWsConnected(true);
+      setHttpFallbackActive(false);
+      addLog(`WebSocket connected: ${backendConfig.wsUrl}`, 'success');
       setStatusMessage((prev) => {
         if (prev.includes('WebRTC active')) return prev;
         return `WebSocket connected to ${backendConfig.wsUrl}. Ready for control input.`;
       });
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (unmountedRef.current) return;
       setWsConnected(false);
+      wsRef.current = null;
+
+      const code = Number(event?.code) || 0;
+      if (!wsEverOpenedRef.current) {
+        setStatusMessage(
+          `WebSocket handshake failed at ${backendConfig.wsUrl}. This network may block WebSocket upgrades; trying HTTP fallback at ${backendConfig.commandUrl}.`
+        );
+        addLog(
+          `WebSocket handshake blocked (code ${code || 'n/a'}). Using HTTP fallback when available.`,
+          'error'
+        );
+      } else {
+        addLog(`WebSocket disconnected (code ${code || 'n/a'}).`, 'info');
+      }
+
+      wsEverOpenedRef.current = false;
     };
 
     ws.onmessage = (event) => {
@@ -669,11 +791,14 @@ function App() {
       if (unmountedRef.current) return;
       let hint = '';
       if (backendConfig.wsUrl.startsWith('wss://')) {
-        hint = ' If this is direct LAN gdog-sim, use the HTTP remote (npm run dev) or put backend behind HTTPS/WSS.';
+        hint = ' Some guest/corporate Wi-Fi allows HTTPS but blocks WebSocket upgrade frames.';
       }
-      setStatusMessage(`WebSocket connection issue at ${backendConfig.wsUrl}. Retrying...${hint}`);
+      setStatusMessage(
+        `WebSocket connection issue at ${backendConfig.wsUrl}. Retrying...${hint} HTTP fallback endpoint: ${backendConfig.commandUrl}`
+      );
+      addLog(`WebSocket error at ${backendConfig.wsUrl}; retrying and using HTTP fallback when needed.`, 'error');
     };
-  }, [backendConfig.input, backendConfig.usingInsecureBackendFromHttpsPage, backendConfig.wsUrl, handleRobotStatusMessage]);
+  }, [addLog, backendConfig.commandUrl, backendConfig.input, backendConfig.usingInsecureBackendFromHttpsPage, backendConfig.wsUrl, handleRobotStatusMessage]);
 
   const applyBackendTarget = useCallback(() => {
     const normalized = normalizeBackendTarget(backendInput);
@@ -684,13 +809,20 @@ function App() {
     const targetChanged = normalized.input !== currentNormalized;
 
     setCapabilities({ loaded: false, webrtc: false });
+    setHttpFallbackActive(false);
+    wsEverOpenedRef.current = false;
+    httpFallbackInFlightRef.current = false;
+    lastHttpFallbackSendMsRef.current = 0;
+    lastHttpFallbackErrorLogMsRef.current = 0;
     if (targetChanged) {
       setBackendTarget(normalized.input);
       setStatusMessage(`Switching backend to ${normalized.httpBase} ...`);
+      addLog(`Switching backend target to ${normalized.httpBase}`, 'info');
       return;
     }
 
     setStatusMessage(`Reconnecting to ${normalized.httpBase} ...`);
+    addLog(`Reconnecting backend transport at ${normalized.httpBase}`, 'info');
     disconnectWebRTC();
     disconnectWebSocket();
     fetchCapabilities();
@@ -702,6 +834,7 @@ function App() {
     disconnectWebRTC,
     disconnectWebSocket,
     fetchCapabilities,
+    addLog,
   ]);
 
   // -- WebRTC Logic --
@@ -791,6 +924,11 @@ function App() {
 
     setStatusMessage(`Connecting to backend at ${backendConfig.httpBase} ...`);
     setCapabilities({ loaded: false, webrtc: false });
+    setHttpFallbackActive(false);
+    wsEverOpenedRef.current = false;
+    httpFallbackInFlightRef.current = false;
+    lastHttpFallbackSendMsRef.current = 0;
+    lastHttpFallbackErrorLogMsRef.current = 0;
     disconnectWebRTC();
     disconnectWebSocket();
     fetchCapabilities();
@@ -942,6 +1080,7 @@ function App() {
       setVoiceSessionConnecting(true);
 
       setStatusMessage('Starting OpenAI voice session...');
+      addLog('Connecting to OpenAI realtime API...', 'info');
       const pc = new RTCPeerConnection();
       openAiPcRef.current = pc;
 
@@ -1085,6 +1224,11 @@ function App() {
                 amount: 0.0,
                 call_id: normalizedCallId,
               });
+              if (sent) {
+                addLog(`Command [${normalizedCallId}] respawn: robot reset to spawn pose`, 'info');
+              } else {
+                addLog(`Command [${normalizedCallId}] failed: robot transport not connected`, 'error');
+              }
               output = {
                 success: sent,
                 command: 'respawn',
@@ -1120,6 +1264,7 @@ function App() {
         setVoiceSessionConnecting(false);
         setVoiceSessionActive(true);
         setStatusMessage('Voice control ready. Start speaking!');
+        addLog('Voice control session established.', 'success');
 
         dc.send(JSON.stringify({
           type: 'session.update',
@@ -1169,6 +1314,7 @@ function App() {
       };
 
       dc.onclose = () => {
+        addLog('Voice control session ended.', 'info');
         stopVoiceControl('Voice control session disconnected.');
       };
 
@@ -1215,6 +1361,7 @@ function App() {
 
     } catch (err) {
       console.error('Voice control error:', err);
+      addLog(`Failed to start voice control: ${err.message}`, 'error');
       stopVoiceControl(null);
       if (!unmountedRef.current) {
         setVoiceSessionConnecting(false);
@@ -1283,6 +1430,7 @@ function App() {
     const ratioRaw = Number(payload.progress_ratio);
     const direction = String(payload.direction || '').trim().toLowerCase();
     const directionText = direction ? `${direction} ` : '';
+    const speedRaw = Number(payload.current_speed || 0);
 
     if (command === 'move') {
       const target = Math.max(0, Number(payload.target_m) || 0);
@@ -1298,6 +1446,7 @@ function App() {
         ratio,
         headline: `Progress: ${directionText}${progress.toFixed(2)}m / ${target.toFixed(2)}m (${(ratio * 100).toFixed(0)}%)`,
         remaining: `${remaining.toFixed(2)}m remaining`,
+        speed: `${Math.abs(speedRaw).toFixed(2)} m/s`,
       };
     }
 
@@ -1316,11 +1465,14 @@ function App() {
       const ratio = Number.isFinite(ratioRaw)
         ? clamp(ratioRaw, 0, 1)
         : (targetDeg > 0 ? clamp(progressDeg / targetDeg, 0, 1) : 0);
+        
+      const speedDeg = Math.abs(speedRaw) * 180 / Math.PI;
 
       return {
         ratio,
         headline: `Progress: ${directionText}${progressDeg.toFixed(0)}deg / ${targetDeg.toFixed(0)}deg (${(ratio * 100).toFixed(0)}%)`,
         remaining: `${remainingDeg.toFixed(0)}deg remaining`,
+        speed: `${speedDeg.toFixed(1)} deg/s`,
       };
     }
 
@@ -1421,6 +1573,22 @@ function App() {
         <div style={{ fontSize: '0.92rem', color: 'var(--text)' }}>
           Active backend: {backendConfig.httpBase}
         </div>
+
+        <div style={{ fontSize: '0.84rem', color: 'var(--text)' }}>
+          Transport: {webrtcConnected
+            ? 'WebRTC data channel'
+            : wsConnected
+              ? 'WebSocket'
+              : httpFallbackActive
+                ? 'HTTP fallback (restricted network mode)'
+                : 'Connecting...'}
+        </div>
+
+        {httpFallbackActive ? (
+          <div style={{ fontSize: '0.84rem', color: '#b45309' }}>
+            WebSocket upgrades look blocked on this network. Commands are using HTTPS POST fallback at a reduced update rate.
+          </div>
+        ) : null}
 
         <div style={{ fontSize: '0.84rem', color: 'var(--text)' }}>
           Tip: share a preconfigured link like <code>?backend=192.168.1.25:8000</code>
@@ -1528,8 +1696,9 @@ function App() {
 
             {pendingVoiceProgressView ? (
               <>
-                <div>
-                  {pendingVoiceProgressView.headline} · {pendingVoiceProgressView.remaining}
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem' }}>
+                  <span>{pendingVoiceProgressView.headline}</span>
+                  <span>{pendingVoiceProgressView.speed} · {pendingVoiceProgressView.remaining}</span>
                 </div>
                 <div
                   style={{
@@ -1554,6 +1723,72 @@ function App() {
             )}
           </div>
         ) : null}
+        
+        <div style={{ marginTop: '0.5rem', borderTop: '1px solid var(--border)', paddingTop: '0.7rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>Diagnostic Logs</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+              <button
+                onClick={() => setLogs([])}
+                disabled={logs.length === 0}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6,
+                  color: 'var(--text-h)',
+                  cursor: logs.length === 0 ? 'not-allowed' : 'pointer',
+                  fontSize: '0.8rem',
+                  padding: '0.2rem 0.5rem',
+                  opacity: logs.length === 0 ? 0.45 : 1,
+                }}
+              >
+                Clear
+              </button>
+              <button
+                onClick={() => setLogsExpanded(!logsExpanded)}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: 'var(--text-h)',
+                  cursor: 'pointer',
+                  fontSize: '0.85rem'
+                }}
+              >
+                {logsExpanded ? '🔼 Hide' : `🔽 Show (${logs.length})`}
+              </button>
+            </div>
+          </div>
+          
+          {logsExpanded && (
+            <div style={{
+              marginTop: '0.5rem',
+              maxHeight: '200px',
+              overflowY: 'auto',
+              background: 'var(--bg)',
+              borderRadius: 6,
+              padding: '0.5rem',
+              fontSize: '0.8rem',
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.2rem'
+            }}>
+              {logs.length === 0 ? (
+                <div style={{ color: 'var(--text)', fontStyle: 'italic' }}>No logs yet...</div>
+              ) : (
+                logs.map(log => (
+                  <div key={log.id} style={{ display: 'flex', gap: '0.5rem' }}>
+                    <span style={{ color: 'var(--text)', opacity: 0.7, flexShrink: 0 }}>[{log.time}]</span>
+                    <span style={{ 
+                      color: log.type === 'error' ? '#ef4444' : log.type === 'success' ? '#10b981' : 'var(--text-h)',
+                      wordBreak: 'break-word'
+                    }}>{log.msg}</span>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </div>
       </div>
       
       <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem', marginBottom: '2rem' }}>
