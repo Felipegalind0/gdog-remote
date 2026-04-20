@@ -383,8 +383,12 @@ function App() {
   const [viewport, setViewport] = useState(() => ({ width: window.innerWidth, height: window.innerHeight }));
   const [logs, setLogs] = useState([]);
   const [logsExpanded, setLogsExpanded] = useState(false);
+  const [tuneVars, setTuneVars] = useState([]);
+  const [selectedTuneVar, setSelectedTuneVar] = useState('');
+  const [tunePanelExpanded, setTunePanelExpanded] = useState(false);
   
   const appRef = useRef(null);
+  const joystickPanelRef = useRef(null);
   const pcRef = useRef(null);
   const dcRef = useRef(null);
   const wsRef = useRef(null);
@@ -761,6 +765,24 @@ function App() {
     const eventId = Number(message?._event_id);
     if (Number.isFinite(eventId)) {
       eventsSinceIdRef.current = Math.max(eventsSinceIdRef.current, eventId);
+    }
+
+    if (message?.type === 'tune_list') {
+      const vars = Array.isArray(message.vars) ? message.vars : [];
+      setTuneVars(vars);
+      if (vars.length > 0) {
+        setSelectedTuneVar((prev) => (vars.find((v) => v.name === prev) ? prev : vars[0].name));
+      }
+      return;
+    }
+
+    if (message?.type === 'tune_result') {
+      if (message.ok) {
+        setTuneVars((prev) =>
+          prev.map((v) => (v.name === message.name ? { ...v, value: message.value } : v))
+        );
+      }
+      return;
     }
 
     if (message?.type === 'voice_command_progress') {
@@ -1191,6 +1213,7 @@ function App() {
       setWsConnected(true);
       setHttpFallbackActive(false);
       addLog(`WebSocket connected: ${backendConfig.wsUrl}`, 'success');
+      try { ws.send(JSON.stringify({ tune_cmd: 'list' })); } catch {}
       setStatusMessage((prev) => {
         if (prev.includes('WebRTC active')) return prev;
         return `WebSocket connected to ${backendConfig.wsUrl}. Ready for control input.`;
@@ -1394,6 +1417,23 @@ function App() {
       setViewport({ width: window.innerWidth, height: window.innerHeight });
     };
 
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
+      window.removeEventListener('resize', handleResize);
+    };
+  }, []);
+
+  useEffect(() => {
+    const joystickPanel = joystickPanelRef.current;
+    if (!joystickPanel) {
+      return undefined;
+    }
+
     const preventGesture = (event) => {
       event.preventDefault();
     };
@@ -1411,26 +1451,20 @@ function App() {
     };
 
     const passiveFalse = { passive: false };
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
-    window.addEventListener('resize', handleResize);
 
-    // Disable browser gesture recognizers that conflict with dual-thumb joystick control.
-    document.addEventListener('gesturestart', preventGesture, passiveFalse);
-    document.addEventListener('gesturechange', preventGesture, passiveFalse);
-    document.addEventListener('gestureend', preventGesture, passiveFalse);
-    document.addEventListener('touchmove', preventTwoFingerTouchMove, passiveFalse);
-    window.addEventListener('wheel', preventCtrlWheelZoom, passiveFalse);
+    // Limit gesture suppression to the joystick region so the rest of the UI keeps normal touch behavior.
+    joystickPanel.addEventListener('gesturestart', preventGesture, passiveFalse);
+    joystickPanel.addEventListener('gesturechange', preventGesture, passiveFalse);
+    joystickPanel.addEventListener('gestureend', preventGesture, passiveFalse);
+    joystickPanel.addEventListener('touchmove', preventTwoFingerTouchMove, passiveFalse);
+    joystickPanel.addEventListener('wheel', preventCtrlWheelZoom, passiveFalse);
 
     return () => {
-      document.removeEventListener('fullscreenchange', handleFullscreenChange);
-      document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
-      window.removeEventListener('resize', handleResize);
-      document.removeEventListener('gesturestart', preventGesture, passiveFalse);
-      document.removeEventListener('gesturechange', preventGesture, passiveFalse);
-      document.removeEventListener('gestureend', preventGesture, passiveFalse);
-      document.removeEventListener('touchmove', preventTwoFingerTouchMove, passiveFalse);
-      window.removeEventListener('wheel', preventCtrlWheelZoom, passiveFalse);
+      joystickPanel.removeEventListener('gesturestart', preventGesture, passiveFalse);
+      joystickPanel.removeEventListener('gesturechange', preventGesture, passiveFalse);
+      joystickPanel.removeEventListener('gestureend', preventGesture, passiveFalse);
+      joystickPanel.removeEventListener('touchmove', preventTwoFingerTouchMove, passiveFalse);
+      joystickPanel.removeEventListener('wheel', preventCtrlWheelZoom, passiveFalse);
     };
   }, []);
 
@@ -1902,7 +1936,9 @@ function App() {
     justifyContent: 'center',
     gap: isFullscreen ? 'clamp(1rem, 6vw, 5rem)' : '2.5rem',
     flexWrap: 'wrap',
-    marginTop: isFullscreen ? '0.8rem' : '1.5rem'
+    marginTop: isFullscreen ? '0.8rem' : '1.5rem',
+    touchAction: 'none',
+    overscrollBehavior: 'contain',
   };
 
   const pendingVoiceRemainingSec = pendingVoiceCommand
@@ -1988,7 +2024,6 @@ function App() {
         backgroundColor: 'var(--bg)',
         color: 'var(--text-h)',
         boxSizing: 'border-box',
-        touchAction: 'none',
         overscrollBehavior: 'none',
       }}
     >
@@ -2526,7 +2561,94 @@ function App() {
         </button>
       </div>
 
-      <div style={panelStyle}>
+      {tuneVars.length > 0 && (
+        <div
+          style={{
+            borderRadius: 12,
+            padding: '1rem 1rem 0.75rem',
+            display: 'grid',
+            gap: '0.9rem',
+            textAlign: 'left',
+            background: 'var(--code-bg)'
+          }}
+        >
+          <div
+            style={{ fontWeight: 600, cursor: 'pointer', userSelect: 'none' }}
+            onClick={() => setTunePanelExpanded((v) => !v)}
+          >
+            Tune {tunePanelExpanded ? '▾' : '▸'}
+          </div>
+
+          {tunePanelExpanded && (() => {
+            const selected = tuneVars.find((v) => v.name === selectedTuneVar) || tuneVars[0];
+            return (
+              <>
+                <select
+                  value={selected.name}
+                  onChange={(e) => setSelectedTuneVar(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '0.4rem',
+                    borderRadius: 6,
+                    border: '1px solid var(--border)',
+                    background: 'var(--social-bg)',
+                    color: 'var(--text-h)',
+                    fontSize: '0.85rem'
+                  }}
+                >
+                  {tuneVars.map((v) => (
+                    <option key={v.name} value={v.name}>{v.name}</option>
+                  ))}
+                </select>
+
+                <label style={{ display: 'grid', gap: '0.4rem' }}>
+                  <span style={{ fontSize: '0.85rem' }}>
+                    {selected.value.toFixed(4)} &nbsp;
+                    <span style={{ opacity: 0.5 }}>[{selected.min} … {selected.max}] step {selected.step}</span>
+                  </span>
+                  <input
+                    type="range"
+                    min={selected.min}
+                    max={selected.max}
+                    step={selected.step}
+                    value={selected.value}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setTuneVars((prev) =>
+                        prev.map((v) => (v.name === selected.name ? { ...v, value: val } : v))
+                      );
+                      sendControlPayload({ tune_cmd: 'set', name: selected.name, value: val });
+                    }}
+                  />
+                </label>
+
+                <button
+                  onClick={() => {
+                    sendControlPayload({ tune_cmd: 'set', name: selected.name, value: selected.default });
+                    setTuneVars((prev) =>
+                      prev.map((v) => (v.name === selected.name ? { ...v, value: selected.default } : v))
+                    );
+                  }}
+                  style={{
+                    justifySelf: 'start',
+                    marginTop: '0.15rem',
+                    padding: '0.45rem 0.75rem',
+                    border: '1px solid var(--border)',
+                    borderRadius: 8,
+                    background: 'var(--social-bg)',
+                    color: 'var(--text-h)',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Reset to default ({selected.default})
+                </button>
+              </>
+            );
+          })()}
+        </div>
+      )}
+
+      <div ref={joystickPanelRef} style={panelStyle}>
         <Joystick label="Drive + Yaw (L, X/Y axes)" color="#1f77b4" onChange={handleLeftJoystick} size={joystickSize} />
         <Joystick label="Pitch + Roll (R, X/Y axes)" color="#c0392b" onChange={handleRightJoystick} size={joystickSize} />
       </div>
